@@ -1,15 +1,16 @@
 "use client";
 
-import React, { useState, useMemo, useCallback } from 'react';
-import { 
-  FileText, Download, Trash2, Settings, 
-  BarChart3, AlertTriangle, CheckCircle, 
-  ArrowLeft, Award, Database, Search, Terminal
+import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
+import * as XLSX from 'xlsx';
+import {
+    FileText, Download, Trash2, Settings,
+    AlertTriangle, CheckCircle, ArrowLeft,
+    Database, Search, Terminal, X, FileSpreadsheet, BarChart3
 } from 'lucide-react';
 import Swal from 'sweetalert2';
 import Link from 'next/link';
 
-// --- (Keep OUTPUT_COLUMNS, KNOWN_CYCLE_TYPES, etc. unchanged) ---
+// TYPES
 const OUTPUT_COLUMNS = [
     '⚠️ ตรวจสอบ?', 'Change log', 'Legacy ID', 'Offering Name', 'Notification Name (Eng)',
     'Notification Name (Thai)', 'Remark', 'Cycle Type', 'Cycle Length',
@@ -22,479 +23,497 @@ const OUTPUT_COLUMNS = [
     'Deploy State', 'Sale Start Date'
 ] as const;
 
-type ExtractedData = Partial<Record<typeof OUTPUT_COLUMNS[number], string>>;
+type ColKey = typeof OUTPUT_COLUMNS[number];
+type ExtractedData = Partial<Record<ColKey, string>>;
 
+const EXPORT_COLUMNS = OUTPUT_COLUMNS.filter(
+    col => col !== '⚠️ ตรวจสอบ?' && col !== 'Change log'
+);
+
+// CONSTANTS
 const KNOWN_CYCLE_TYPES = new Set([
     '1day', '1days', '15day', '15days', '186days', '2days', '217days', '24hours',
     '3days', '30days', '31calendar days', '31days', '372days', '434days',
     '45days', '7days', '8days', '90days', '93days', '99days',
     'Bill Cycle', 'Life Time', '31 calendar_day'
 ]);
-
+const normalizeCycleType = (s: string) => s.replace(/[\s_]/g, '').toLowerCase();
 const cycleTypeRegex = new RegExp(
-    [...KNOWN_CYCLE_TYPES].sort((a, b) => b.length - a.length).join('|'),
-    'i'
+    [...KNOWN_CYCLE_TYPES].sort((a, b) => b.length - a.length)
+        .map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '[\\s_]*'))
+        .join('|'), 'i'
 );
-
 const KNOWN_RETRY_TIMES = new Set(['3', '7', '99', '999', '9999']);
 const KNOWN_CYCLE_SHIFTS = new Set(['Shift', 'Not Shift']);
+const DEPLOY_STATE_MAP: Record<string, string> = {
+    'in-progress': 'In-progress', 'deploy': 'Deploy', 'approved': 'Approved',
+    'draft': 'Draft', 'inactive': 'Inactive', 'active': 'Active',
+};
+const ACTION_AFTER_RETRY_PATTERNS = ['Cancel offer', 'Suspend', 'Terminate', 'Grace period', 'None'];
+const THAI_MONTH_SHORT: Record<string, string> = {
+    'ม.ค.': '01', 'ก.พ.': '02', 'มี.ค.': '03', 'เม.ย.': '04',
+    'พ.ค.': '05', 'มิ.ย.': '06', 'ก.ค.': '07', 'ส.ค.': '08',
+    'ก.ย.': '09', 'ต.ค.': '10', 'พ.ย.': '11', 'ธ.ค.': '12',
+    'มกราคม': '01', 'กุมภาพันธ์': '02', 'มีนาคม': '03', 'เมษายน': '04',
+    'พฤษภาคม': '05', 'มิถุนายน': '06', 'กรกฎาคม': '07', 'สิงหาคม': '08',
+    'กันยายน': '09', 'ตุลาคม': '10', 'พฤศจิกายน': '11', 'ธันวาคม': '12',
+};
 
-// --- (Logic functions: masterExtractor, extractKeyValueData, extractTabSeparatedData - Keep your original logic) ---
+function parseThaiDate(raw: string): string {
+    if (!raw) return '';
+    if (/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$/.test(raw.trim())) return raw.trim();
+    const m = raw.match(/(\d{1,2})\s+([ก-๙a-zA-Z.]+)\s+(\d{2,4})/);
+    if (m) {
+        const day = m[1].padStart(2, '0');
+        const monthKey = Object.keys(THAI_MONTH_SHORT).find(k => m[2].startsWith(k.replace('.', '')));
+        const month = monthKey ? THAI_MONTH_SHORT[monthKey] : '??';
+        let year = parseInt(m[3]);
+        if (year > 2400) year -= 543;
+        if (year < 100) year += 2500 - 543;
+        return `${day}/${month}/${year}`;
+    }
+    return raw.trim();
+}
+
 function extractKeyValueData(textChunk: string): ExtractedData {
     const details: ExtractedData = {};
-    const findPattern = (regex: RegExp, text: string) => (text.match(regex) || [])[1]?.trim() || '';
-
-    const notifLineMatch = textChunk.match(/Notification Name \(Eng\)\s*:\s*([^\r\n]*)/m);
-    if (notifLineMatch) {
-        const fullLine = notifLineMatch[1];
-        const parts = fullLine.split(/Notification Name \(Th\)\s*:/);
+    const find = (regex: RegExp) => (textChunk.match(regex) || [])[1]?.trim() || '';
+    const notifLine = textChunk.match(/Notification Name \(Eng\)\s*:\s*([^\r\n]*)/m);
+    if (notifLine) {
+        const parts = notifLine[1].split(/Notification Name \(Th\)\s*:/);
         details['Notification Name (Eng)'] = parts[0]?.trim() || '';
-        if (parts.length > 1) {
-            details['Notification Name (Thai)'] = parts[1]?.trim() || '';
-        }
+        if (parts[1]) details['Notification Name (Thai)'] = parts[1]?.trim();
     }
-    if (!details['Notification Name (Thai)']) {
-        details['Notification Name (Thai)'] = findPattern(/Notification Name \(Th\)\s*:\s*([^\r\n]*)/m, textChunk);
-    }
-
-    details['Legacy ID'] = findPattern(/รหัสโปรโมชั่น\s*:\s*(\d{8})/m, textChunk);
-    details['Offering Name'] = findPattern(/ชื่อโปรใน OCS\s*:\s*([^\r\n]*)/m, textChunk);
-
-    let fee = findPattern(/ค่าบริการ \(บาท\/ไม่รวม VAT\)\s*:\s*([\d.]+)/m, textChunk);
-    if (parseFloat(fee) > 0) {
-        details['Rental Fee without tax'] = fee;
-    }
-
-    let periodText = findPattern(/ระยะเวลาใช้บริการ \(Period\)\s*:\s*([\s\S]*?)(?=\s*\*|Cycle Length|$)/, textChunk);
-    if (periodText) {
-        const match = periodText.match(cycleTypeRegex);
-        if (match) details['Cycle Type'] = match[0];
-    }
-
-    let lengthText = findPattern(/Cycle Length\s*:\s*([^\r\n]*)/m, textChunk);
-    if (/^(\d+\s*รอบบิล|\d+\s*times?|Renew)$/i.test(lengthText)) {
-        details['Cycle Length'] = lengthText.replace('รอบบิล', 'times');
-    }
-
-    details['Prorate RC & FU'] = findPattern(/เกณฑ์การคิดค่าบริการ\s*:\s*(Prorate|Not Prorate)/m, textChunk);
-    details['RC failed need Suspend ?'] = findPattern(/RC failed need Suspend \?\s*:\s*(Suspend)/m, textChunk);
-    details['Retry RC times'] = findPattern(/Retry RC times\s*:\s*(3|7|99|999|9999)\b/m, textChunk);
-    details['Cycle shift'] = findPattern(/ระยะเวลาใช้บริการในรอบบิลต่อไป\s*:\s*(Shift|Not Shift)/m, textChunk);
-
-    details['Sale Start Date'] = findPattern(/วันที่เริ่มจำหน่าย \(Sale Start Date\)\s*:\s*(\d{1,2}[-]\d{1,2}[-]\d{4}|\d{1,2}\s*[ก-๙]+\s*\d{2})/m, textChunk) || findPattern(/(\d{1,2}\s*[ก-๙]+\s*\d{2})/m, textChunk.split('Channel name')[1] || '');
-    details['Deploy Date'] = findPattern(/วันเริ่มต้นใช้แพ็กเกจ \(Effective Date\)\s*:\s*(\d{1,2}[-\/]\d{1,2}[-\/]\d{4})/m, textChunk);
-
-    const statusText = findPattern(/สถานะโปรโมชั่น\s*:\s*([^\r\n]*)/m, textChunk);
-    if (statusText) details['Deploy State'] = statusText;
-
-    const speedMatch = findPattern(/โปรโมชั่น.*?เน็ต.*?\s([\d.]+Mbps)/m, textChunk);
-    if (speedMatch) {
-        details['Speed'] = `เน็ตไม่จำกัด ${speedMatch}`;
-        details['SpeedTemplate'] = speedMatch;
-    }
-
+    if (!details['Notification Name (Thai)']) details['Notification Name (Thai)'] = find(/Notification Name \(Th\)\s*:\s*([^\r\n]*)/m);
+    details['Legacy ID'] = find(/รหัสโปรโมชั่น\s*:\s*(\d{8})/m);
+    details['Offering Name'] = find(/ชื่อโปรใน OCS\s*:\s*([^\r\n]*)/m);
+    details['Change log'] = find(/Change\s*[Ll]og\s*:\s*([^\r\n]*)/m);
+    const fee = find(/ค่าบริการ \(บาท\/ไม่รวม VAT\)\s*:\s*([\d.]+)/m);
+    if (parseFloat(fee) > 0) details['Rental Fee without tax'] = fee;
+    const periodText = find(/ระยะเวลาใช้บริการ \(Period\)\s*:\s*([\s\S]*?)(?=\s*\*|Cycle Length|$)/);
+    if (periodText) { const match = periodText.match(cycleTypeRegex); if (match) details['Cycle Type'] = match[0]; }
+    const lengthText = find(/Cycle Length\s*:\s*([^\r\n]*)/m);
+    if (/^(\d+\s*รอบบิล|\d+\s*times?|Renew)$/i.test(lengthText)) details['Cycle Length'] = lengthText.replace('รอบบิล', 'times');
+    details['Prorate RC & FU'] = find(/เกณฑ์การคิดค่าบริการ\s*:\s*(Prorate|Not Prorate)/m);
+    details['RC failed need Suspend ?'] = find(/RC failed need Suspend \?\s*:\s*(Suspend)/m);
+    details['Retry RC times'] = find(/Retry RC times\s*:\s*(3|7|99|999|9999)\b/m);
+    details['Cycle shift'] = find(/ระยะเวลาใช้บริการในรอบบิลต่อไป\s*:\s*(Shift|Not Shift)/m);
+    const actionText = find(/Action after max retry\s*:\s*([^\r\n]*)/m);
+    if (actionText) { const found = ACTION_AFTER_RETRY_PATTERNS.find(a => actionText.toLowerCase().includes(a.toLowerCase())); details['Action after max retry'] = found || actionText; }
+    details['Sale Start Date'] = parseThaiDate(find(/วันที่เริ่มจำหน่าย \(Sale Start Date\)\s*:\s*([^\r\n]*)/m));
+    details['Deploy Date'] = parseThaiDate(find(/วันเริ่มต้นใช้แพ็กเกจ \(Effective Date\)\s*:\s*([^\r\n]*)/m));
+    const statusText = find(/สถานะโปรโมชั่น\s*:\s*([^\r\n]*)/m);
+    if (statusText) details['Deploy State'] = DEPLOY_STATE_MAP[statusText.toLowerCase().trim()] || statusText;
+    details['Voice Tariff'] = find(/Voice Tariff\s*:\s*([^\r\n]*)/m);
+    details['SMS Tariff'] = find(/SMS Tariff\s*:\s*([^\r\n]*)/m);
+    details['MMS Tariff'] = find(/MMS Tariff\s*:\s*([^\r\n]*)/m);
+    details['GPRS Tariff'] = find(/GPRS Tariff\s*:\s*([^\r\n]*)/m);
+    details['Balance ID'] = find(/Balance\s*ID\s*:\s*([^\r\n\s]*)/m);
+    details['FU ID'] = find(/FU\s*ID\s*:\s*([^\r\n\s]*)/m);
+    details['Offer ID'] = find(/Offer\s*ID\s*:\s*([^\r\n\s]*)/m);
+    details['SCG config existing'] = find(/SCG\s*config\s*existing\s*:\s*([^\r\n]*)/m);
+    details['Bonus'] = find(/Bonus\s*:\s*([YN])/m);
+    details['Independent Sales'] = find(/Independent Sales\s*:\s*([YN])/m);
+    const speedMatch = find(/โปรโมชั่น.*?เน็ต.*?\s([\d.]+Mbps)/m);
+    if (speedMatch) { details['Speed'] = `เน็ตไม่จำกัด ${speedMatch}`; details['SpeedTemplate'] = speedMatch; }
     return details;
 }
 
 function extractTabSeparatedData(textChunk: string): ExtractedData {
     const details: ExtractedData = {};
-    const fields = textChunk.split(/\t|\s{2,}/).map(f => f.trim()).filter(f => f);
-
-    try {
-        details['Change log'] = fields[0];
-        details['Legacy ID'] = fields.find(f => /^\d{8}$/.test(f)) || '';
-        details['Offering Name'] = fields.find(f => f.startsWith('SO_')) || '';
-        details['Notification Name (Eng)'] = fields[3];
-        details['Notification Name (Thai)'] = fields[4];
-    } catch (e) { }
-
-    fields.forEach((field) => {
-        if (/^(\d+\s*times?|Renew)$/i.test(field) && !details['Cycle Length']) {
-            details['Cycle Length'] = field;
-        } else if (KNOWN_RETRY_TIMES.has(field) && !details['Retry RC times']) {
-            details['Retry RC times'] = field;
-        } else if (KNOWN_CYCLE_SHIFTS.has(field) && !details['Cycle shift']) {
-            details['Cycle shift'] = field;
-        } else if (field === 'Prorate' || field === 'Not Prorate') {
-            details['Prorate RC & FU'] = field;
-        } else if (field === 'Suspend') {
-            details['RC failed need Suspend ?'] = field;
-        } else if (field === 'Cancel offer') {
-            details['Action after max retry'] = field;
-        } else if (/^\d+(\.\d+)?$/.test(field) && !details['Rental Fee without tax']) {
-            const fee = parseFloat(field);
-            if (fee > 0) {
-                details['Rental Fee without tax'] = field;
-            }
-        } else if (/^(\dG\/?)+$/.test(field)) {
-            details['Type'] = field;
-        } else if (/Bytes/.test(field) && !/DATA VOLUME/.test(details['Free unit type OCS'] || '')) {
-            details['Free unit type Legacy'] = 'DATA VOLUME';
-            details['Free unit type OCS'] = 'DATA VOLUME';
-            details['Free unit value'] = field;
-        } else if (/Baht \//.test(field)) {
-            details['GPRS Tariff'] = field;
-        } else if (/อินเทอร์เน็ต|โทรฟรี/.test(field)) {
-            details['Speed'] = field;
-        } else if (/Kbps|Mbps|No FUP/i.test(field)) {
-            details['SpeedTemplate'] = field;
-        } else if (field === 'Y' && !details['Bonus']) {
-            details['Bonus'] = field;
-        } else if (field === 'N' && !details['Independent Sales']) {
-            details['Independent Sales'] = field;
-        } else if (/\d{1,2}[-\/]\d{1,2}[-\/]\d{4}/.test(field) && !details['Deploy Date']) {
-            details['Deploy Date'] = field.match(/(\d{1,2}[-\/]\d{1,2}[-\/]\d{4})/)?.[0] || '';
-        } else if (/\d{1,2}[-\/]\d{1,2}[-\/]\d{4}/.test(field) && !details['Sale Start Date']) {
-            details['Sale Start Date'] = field.match(/(\d{1,2}[-\/]\d{1,2}[-\/]\d{4})/)?.[0] || '';
-        } else if (/in-progress|deploy/i.test(field)) {
-            details['Deploy State'] = field;
-        }
+    const fields = textChunk.split(/\t|\s{2,}/).map(f => f.trim()).filter(Boolean);
+    details['Change log'] = fields[0] || '';
+    details['Legacy ID'] = fields.find(f => /^\d{8}$/.test(f)) || '';
+    details['Offering Name'] = fields.find(f => f.startsWith('SO_')) || '';
+    details['Notification Name (Eng)'] = fields[3] || '';
+    details['Notification Name (Thai)'] = fields[4] || '';
+    fields.forEach(field => {
+        if (/^(\d+\s*times?|Renew)$/i.test(field) && !details['Cycle Length']) details['Cycle Length'] = field;
+        else if (KNOWN_RETRY_TIMES.has(field) && !details['Retry RC times']) details['Retry RC times'] = field;
+        else if (KNOWN_CYCLE_SHIFTS.has(field) && !details['Cycle shift']) details['Cycle shift'] = field;
+        else if (field === 'Prorate' || field === 'Not Prorate') details['Prorate RC & FU'] = field;
+        else if (field === 'Suspend' && !details['RC failed need Suspend ?']) details['RC failed need Suspend ?'] = field;
+        else if (ACTION_AFTER_RETRY_PATTERNS.includes(field) && !details['Action after max retry']) details['Action after max retry'] = field;
+        else if (/^\d+(\.\d+)?$/.test(field) && !details['Rental Fee without tax']) { const fee = parseFloat(field); if (fee > 0) details['Rental Fee without tax'] = field; }
+        else if (/^(\dG\/?)+$/.test(field)) details['Type'] = field;
+        else if (/Bytes/.test(field)) { details['Free unit type Legacy'] = 'DATA VOLUME'; details['Free unit type OCS'] = 'DATA VOLUME'; details['Free unit value'] = field; }
+        else if (/Baht \//.test(field)) { if (/Voice/i.test(field)) details['Voice Tariff'] = field; else if (/SMS/i.test(field)) details['SMS Tariff'] = field; else if (/MMS/i.test(field)) details['MMS Tariff'] = field; else details['GPRS Tariff'] = field; }
+        else if (/อินเทอร์เน็ต|โทรฟรี/.test(field)) details['Speed'] = field;
+        else if (/Kbps|Mbps|No FUP/i.test(field)) details['SpeedTemplate'] = field;
+        else if (field === 'Y' && !details['Bonus']) details['Bonus'] = field;
+        else if (field === 'N' && !details['Bonus'] && !details['Independent Sales']) details['Independent Sales'] = field;
+        else if (/^B\d+$/.test(field) && !details['Balance ID']) details['Balance ID'] = field;
+        else if (/^FU\d+$/i.test(field) && !details['FU ID']) details['FU ID'] = field;
+        else if (/^OF\d+$/i.test(field) && !details['Offer ID']) details['Offer ID'] = field;
+        else if (/\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}/.test(field)) { const d = parseThaiDate(field); if (!details['Deploy Date']) details['Deploy Date'] = d; else if (!details['Sale Start Date']) details['Sale Start Date'] = d; }
+        else if (/in-progress|deploy|approved|draft|inactive|active/i.test(field)) details['Deploy State'] = DEPLOY_STATE_MAP[field.toLowerCase().trim()] || field;
     });
-
     return details;
 }
 
 function masterExtractor(textChunk: string): ExtractedData {
     let details: ExtractedData;
-
-    if (/^\d{8}:\s*New/.test(textChunk)) {
-        details = extractTabSeparatedData(textChunk);
-    } else if (/รหัสโปรโมชั่น\s*:|ค่าบริการ \(บาท\/ไม่รวม VAT\)/.test(textChunk)) {
-        details = extractKeyValueData(textChunk);
-    } else {
-        details = {};
-    }
-
+    if (/^\d{8}:\s*New/.test(textChunk)) details = extractTabSeparatedData(textChunk);
+    else if (/รหัสโปรโมชั่น\s*:|ค่าบริการ \(บาท\/ไม่รวม VAT\)/.test(textChunk)) details = extractKeyValueData(textChunk);
+    else details = {};
     if (!details['Cycle Type']) {
-        const searchableText = `${details['Offering Name'] || ''} ${details['Notification Name (Eng)'] || ''} ${textChunk}`;
-        const match = searchableText.match(cycleTypeRegex);
-        if (match) {
-            const matchedValue = match[0].toLowerCase();
-            const originalCasing = [...KNOWN_CYCLE_TYPES].find(k => k.replace(/\s+/g, '').toLowerCase() === matchedValue.replace(/\s+/g, ''));
-            details['Cycle Type'] = originalCasing || match[0];
-        }
+        const searchable = `${details['Offering Name'] || ''} ${details['Notification Name (Eng)'] || ''} ${textChunk}`;
+        const match = searchable.match(cycleTypeRegex);
+        if (match) { const nm = normalizeCycleType(match[0]); details['Cycle Type'] = [...KNOWN_CYCLE_TYPES].find(k => normalizeCycleType(k) === nm) || match[0]; }
     }
-
     let speedValue: string | null = null;
-    const remarkSpeedMatch = textChunk.match(/Remark\s*:\s*Speed.*?\s*(\d+)\s*Mbps/i);
-    if (remarkSpeedMatch && remarkSpeedMatch[1]) {
-        speedValue = remarkSpeedMatch[1];
-    }
-
-    if (!speedValue && details['Offering Name']) {
-        const nameSpeedMatch = details['Offering Name'].match(/_(\d+)(M|Mbps)/i);
-        if (nameSpeedMatch && nameSpeedMatch[1]) {
-            speedValue = nameSpeedMatch[1];
-        }
-    }
-
-    if (speedValue) {
-        const ocsString = `3G/4G DATA VOLUME ${speedValue}M`;
-        details['Free unit type OCS'] = ocsString;
-        details['Free unit type Legacy'] = ocsString;
-    }
-
-    details['Remark'] = 'Pre-collection';
-
-    if (details['Deploy State'] && /in-progress|deploy/i.test(details['Deploy State'])) {
-        details['Deploy State'] = 'In-progress';
-    }
-
-    if (details['Rental Fee without tax']) {
-        const fee = parseFloat(details['Rental Fee without tax']!);
-        if (!isNaN(fee)) {
-            details['Rental Fee without tax'] = fee.toFixed(6);
-        }
-    }
-
-    const criticalFields = ['Legacy ID', 'Offering Name'] as const;
-    const missingCriticalFields = criticalFields.filter(field => !details[field as keyof ExtractedData] || details[field as keyof ExtractedData]!.trim() === '');
-    details['⚠️ ตรวจสอบ?'] = missingCriticalFields.length > 0 ? 'ควรตรวจสอบ' : '';
-
+    const rsm = textChunk.match(/Remark\s*:\s*Speed.*?\s(\d+)\s*Mbps/i);
+    if (rsm?.[1]) speedValue = rsm[1];
+    if (!speedValue && details['Offering Name']) { const ns = details['Offering Name'].match(/_(\d+)(M|Mbps)/i); if (ns?.[1]) speedValue = ns[1]; }
+    if (speedValue) { const s = `3G/4G DATA VOLUME ${speedValue}M`; details['Free unit type OCS'] = s; details['Free unit type Legacy'] = s; }
+    if (!details['Free unit type OCS'] && /โทรฟรี|Voice|เสียง/i.test(textChunk)) { details['Free unit type OCS'] = 'VOICE'; details['Free unit type Legacy'] = 'VOICE'; }
+    details['Remark'] = details['Remark'] || 'Pre-collection';
+    if (details['Rental Fee without tax']) { const f = parseFloat(details['Rental Fee without tax']); if (!isNaN(f)) details['Rental Fee without tax'] = f.toFixed(6); }
+    const missing = (['Legacy ID', 'Offering Name'] as ColKey[]).filter(f => !details[f]?.trim());
+    details['⚠️ ตรวจสอบ?'] = missing.length > 0 ? 'ควรตรวจสอบ' : '';
     return details;
 }
 
-
+// COMPONENT
 export default function PromotionExtractor() {
-    const [rawInput, setRawInput] = useState<string>('');
-    const [extractedDataList, setExtractedDataList] = useState<ExtractedData[]>([]);
-    const [status, setStatus] = useState<string>('Ready to process');
+    const [rawInput, setRawInput] = useState('');
+    const [dataList, setDataList] = useState<ExtractedData[]>([]);
+    const [status, setStatus] = useState('Awaiting input');
+    const [editCell, setEditCell] = useState<{ row: number; col: ColKey } | null>(null);
+    const editRef = useRef<HTMLInputElement>(null);
+    const canvasRef = useRef<HTMLCanvasElement>(null);
 
-    const reviewCount = useMemo(() => extractedDataList.filter(d => d['⚠️ ตรวจสอบ?'] === 'ควรตรวจสอบ').length, [extractedDataList]);
-    const isProcessed = extractedDataList.length > 0;
+    const reviewCount = useMemo(() => dataList.filter(d => d['⚠️ ตรวจสอบ?'] === 'ควรตรวจสอบ').length, [dataList]);
+    const isProcessed = dataList.length > 0;
+
+    // Dot grid — same as hub
+    useEffect(() => {
+        const canvas = canvasRef.current; if (!canvas) return;
+        const ctx = canvas.getContext('2d'); if (!ctx) return;
+        const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+        resize(); window.addEventListener('resize', resize);
+        let frame = 0;
+        const draw = () => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const sp = 40, cols = Math.ceil(canvas.width / sp), rows = Math.ceil(canvas.height / sp);
+            for (let x = 0; x <= cols; x++) for (let y = 0; y <= rows; y++) {
+                const p = Math.sin(frame * 0.008 + x * 0.3 + y * 0.2) * 0.5 + 0.5;
+                ctx.beginPath(); ctx.arc(x * sp, y * sp, 0.8, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(52,211,153,${0.04 + p * 0.06})`; ctx.fill();
+            }
+            frame++; requestAnimationFrame(draw);
+        };
+        draw(); return () => window.removeEventListener('resize', resize);
+    }, []);
 
     const handleProcess = useCallback(() => {
         setStatus('Processing...');
-        const rawText = rawInput.trim();
-
-        if (!rawText) {
-            Swal.fire({
-                icon: 'warning',
-                title: 'Data Required',
-                text: 'กรุณาวางข้อมูลดิบก่อนประมวลผล',
-                confirmButtonColor: '#1e293b',
-            });
-            setStatus('Ready to process');
-            return;
+        const raw = rawInput.trim();
+        if (!raw) {
+            Swal.fire({ icon: 'warning', title: 'Data Required', text: 'กรุณาวางข้อมูลดิบก่อนประมวลผล', confirmButtonColor: '#0a0c0f' });
+            setStatus('Awaiting input'); return;
         }
-
-        const promoChunks = rawText.split(/(?=\d{8}:\s*New|โปรโมชั่น\s\d+\s*:)/).map(c => c.trim()).filter(c => c);
-        const newExtractedData = promoChunks.map(chunk => masterExtractor(chunk));
-        setExtractedDataList(newExtractedData);
-
-        const currentReviewCount = newExtractedData.filter(d => d['⚠️ ตรวจสอบ?'] === 'ควรตรวจสอบ').length;
-
-        if (currentReviewCount > 0) {
-            Swal.fire({
-                icon: 'info',
-                title: 'Process Complete',
-                text: `พบ ${currentReviewCount} รายการที่ต้องตรวจสอบความถูกต้อง`,
-                confirmButtonColor: '#1e293b',
-            });
-        } else {
-            Swal.fire({
-                icon: 'success',
-                title: 'Success',
-                text: `สกัดข้อมูลสำเร็จ ${newExtractedData.length} รายการ`,
-                timer: 2000,
-                showConfirmButton: false
-            });
-        }
-        setStatus(`✓ Processed ${newExtractedData.length} records`);
+        const chunks = raw.split(/(?=\d{8}:\s*New|โปรโมชั่น\s\d+\s*:)/).map(c => c.trim()).filter(Boolean);
+        const result = chunks.map(chunk => masterExtractor(chunk));
+        setDataList(result);
+        const rc = result.filter(d => d['⚠️ ตรวจสอบ?'] === 'ควรตรวจสอบ').length;
+        if (rc > 0) Swal.fire({ icon: 'info', title: 'Process Complete', text: `พบ ${rc} รายการที่ต้องตรวจสอบ`, confirmButtonColor: '#0a0c0f' });
+        else Swal.fire({ icon: 'success', title: 'Success', text: `สกัดข้อมูลสำเร็จ ${result.length} รายการ`, timer: 2000, showConfirmButton: false });
+        setStatus(`✓ Processed ${result.length} records`);
     }, [rawInput]);
 
-    const handleClear = useCallback(() => {
-        setRawInput('');
-        setExtractedDataList([]);
-        setStatus('Ready to process');
+    const handleClear = useCallback(() => { setRawInput(''); setDataList([]); setStatus('Awaiting input'); setEditCell(null); }, []);
+    const handleDeleteRow = useCallback((idx: number) => setDataList(prev => prev.filter((_, i) => i !== idx)), []);
+    const handleCellEdit = useCallback((row: number, col: ColKey, value: string) => {
+        setDataList(prev => {
+            const next = [...prev]; next[row] = { ...next[row], [col]: value };
+            const missing = (['Legacy ID', 'Offering Name'] as ColKey[]).filter(f => !next[row][f]?.trim());
+            next[row]['⚠️ ตรวจสอบ?'] = missing.length > 0 ? 'ควรตรวจสอบ' : '';
+            return next;
+        });
     }, []);
 
-    const handleDownload = useCallback(() => {
-        if (extractedDataList.length === 0) return;
+    const handleDownloadCSV = useCallback(() => {
+        if (!dataList.length) return;
+        let csv = '\uFEFF' + EXPORT_COLUMNS.map(c => `"${c}"`).join(',') + '\r\n';
+        dataList.forEach(item => { csv += EXPORT_COLUMNS.map(col => `"${String(item[col] || '').replace(/"/g, '""')}"`).join(',') + '\r\n'; });
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+        a.href = url; a.download = `Extracted_Promo_${today}.csv`;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    }, [dataList]);
 
-        let csvContent = "data:text/csv;charset=utf-8," + "\uFEFF";
-        csvContent += OUTPUT_COLUMNS.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',') + '\r\n';
-
-        extractedDataList.forEach(item => {
-            const row = OUTPUT_COLUMNS.map(col => {
-                let cellData = item[col as keyof ExtractedData] || '';
-                return `"${String(cellData).replace(/"/g, '""')}"`;
-            });
-            csvContent += row.join(',') + '\r\n';
-        });
-
-        const encodedUri = encodeURI(csvContent);
-        const link = document.createElement("a");
-        const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-        link.setAttribute("href", encodedUri);
-        link.setAttribute("download", `Extracted_Promo_${today}.csv`);
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-    }, [extractedDataList]);
+    const handleDownloadXLSX = useCallback(() => {
+        if (!dataList.length) return;
+        const wb = XLSX.utils.book_new();
+        const rows = dataList.map(item => EXPORT_COLUMNS.reduce((acc, col) => ({ ...acc, [col]: item[col] || '' }), {} as Record<string, string>));
+        const ws = XLSX.utils.json_to_sheet(rows, { header: [...EXPORT_COLUMNS] });
+        ws['!cols'] = EXPORT_COLUMNS.map(col => ({ wch: Math.max(col.length + 2, 14) }));
+        XLSX.utils.book_append_sheet(wb, ws, 'Promotions');
+        const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+        XLSX.writeFile(wb, `Extracted_Promo_${today}.xlsx`);
+    }, [dataList]);
 
     return (
-        <div className="min-h-screen bg-slate-50 text-slate-900 font-sans antialiased">
-            {/* --- HEADER (Consistent with other pages) --- */}
-            <div className="bg-slate-800 py-14 px-6 relative shadow-xl overflow-hidden">
-                <div className="absolute top-8 left-8">
-                    <Link 
-                        href="/mainocs" 
-                        className="inline-flex items-center gap-2 text-white/70 hover:text-white transition-colors group"
-                    >
-                        <div className="p-2 rounded-full bg-white/10 group-hover:bg-white/20 transition-all text-white">
-                            <ArrowLeft size={18} />
-                        </div>
-                        <span className="font-bold text-sm tracking-wide">Back to Hub</span>
-                    </Link>
-                </div>
+        <div className="relative min-h-screen overflow-x-hidden bg-[#0a0c0f] pb-24">
+            <style jsx global>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@700;800&display=swap');
+        .font-display { font-family: 'Syne', sans-serif; }
+        .font-mono-custom { font-family: 'Space Mono', monospace; }
+        @keyframes fade-up { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:translateY(0); } }
+        .fade-up { opacity:0; animation: fade-up 0.55s cubic-bezier(0.16,1,0.3,1) forwards; }
+        @keyframes scan { 0%{transform:translateY(-100%);opacity:0} 10%{opacity:1} 90%{opacity:1} 100%{transform:translateY(100vh);opacity:0} }
+        .scan-line { animation: scan 8s ease-in-out infinite; }
+        @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.4;transform:scale(0.7)} }
+        .pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+        ::-webkit-scrollbar { width:5px; height:5px; }
+        ::-webkit-scrollbar-track { background:transparent; }
+        ::-webkit-scrollbar-thumb { background:rgba(52,211,153,0.2); border-radius:10px; }
+        ::-webkit-scrollbar-thumb:hover { background:rgba(52,211,153,0.4); }
+      `}</style>
 
-                <div className="text-center">
-                    <div className="inline-flex items-center justify-center p-3 bg-emerald-600 rounded-2xl shadow-lg mb-4 text-white">
-                        <Terminal size={32} />
+            <canvas ref={canvasRef} className="pointer-events-none fixed inset-0" />
+            <div className="scan-line pointer-events-none fixed left-0 top-0 z-10 h-[2px] w-full bg-gradient-to-r from-transparent via-emerald-400/20 to-transparent" />
+            <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(ellipse_80%_50%_at_50%_0%,rgba(16,185,129,0.06),transparent)]" />
+
+            <div className="relative z-10 mx-auto max-w-[1480px] px-6 py-10">
+
+                {/* ── HEADER ── */}
+                <header className="fade-up mb-12" style={{ animationDelay: '0ms' }}>
+                    <div className="mb-8 flex items-center gap-3">
+                        <div className="h-px flex-1 bg-white/[0.06]" />
+                        <span className="font-mono-custom text-[10px] tracking-[0.3em] text-white/25">BILLONE · OCS TOOLS</span>
+                        <div className="h-px flex-1 bg-white/[0.06]" />
                     </div>
-                    <h1 className="text-3xl md:text-4xl font-extrabold text-white tracking-tight">
-                        Promotion Data <span className="text-emerald-400 font-light">Extractor</span>
-                    </h1>
-                    <p className="opacity-70 mt-3 text-white font-light max-w-lg mx-auto">
-                        สกัดข้อมูลโปรโมชั่นจากข้อความดิบให้เป็นรูปแบบตาราง CSV ภายในไม่กี่วินาที
-                    </p>
-                </div>
-            </div>
 
-            {/* --- MAIN CONTENT --- */}
-            <main className="max-w-[1500px] mx-auto px-8 py-10">
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-                    
-                    {/* Left: Input Section */}
-                    <div className="lg:col-span-4 space-y-6">
-                        <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden">
-                            <div className="p-6 border-b border-slate-50 bg-slate-50/50 flex items-center justify-between">
-                                <div className="flex items-center gap-3">
-                                    <Database size={18} className="text-emerald-600" />
-                                    <h3 className="text-sm font-black text-slate-700 uppercase tracking-widest">Source Data</h3>
+                    <div className="flex items-start justify-between gap-4 flex-wrap">
+                        <div>
+                            <Link
+                                href="/mainocs"
+                                className="group mb-5 inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2 font-mono-custom text-[11px] tracking-widest text-white/40 transition-all hover:border-white/20 hover:text-white/70"
+                            >
+                                <ArrowLeft size={12} className="transition-transform group-hover:-translate-x-0.5" />
+                                BACK TO HUB
+                            </Link>
+                            <h1 className="font-display text-4xl font-extrabold leading-tight tracking-tight text-white">
+                                Promotion Data{' '}
+                                <span className="bg-gradient-to-r from-emerald-400 via-teal-300 to-emerald-400 bg-clip-text text-transparent">
+                                    Extractor
+                                </span>
+                            </h1>
+                            <p className="mt-2 font-mono-custom text-[11px] text-white/30">
+                                สกัดข้อมูลโปรโมชั่นจากข้อความดิบ · export CSV / XLSX สำหรับ config OCS
+                            </p>
+                        </div>
+
+                        {/* Status pill */}
+                        <div className="mt-1 flex shrink-0 items-center gap-2.5 rounded-2xl border border-white/10 bg-white/5 px-5 py-3 backdrop-blur-sm">
+                            <div className={`pulse-dot h-2 w-2 rounded-full ${status.startsWith('✓') ? 'bg-emerald-400' : status === 'Processing...' ? 'bg-amber-400' : 'bg-white/20'}`} />
+                            <span className="font-mono-custom text-[11px] text-white/50">{status}</span>
+                        </div>
+                    </div>
+                </header>
+
+                {/* ── MAIN GRID ── */}
+                <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+
+                    {/* LEFT — Input */}
+                    <div className="fade-up lg:col-span-4 space-y-4" style={{ animationDelay: '80ms' }}>
+                        <div className="rounded-2xl border border-white/10 bg-white/5 overflow-hidden">
+                            <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.06]">
+                                <div className="flex items-center gap-2.5">
+                                    <Database size={15} className="text-emerald-400" />
+                                    <span className="font-mono-custom text-[11px] tracking-[0.2em] text-white/50">SOURCE DATA</span>
                                 </div>
-                                <span className="text-[10px] font-bold text-slate-400 px-2 py-1 bg-white border rounded-lg">Auto-Format Detection</span>
+                                <span className="rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 font-mono-custom text-[10px] text-white/25">
+                                    Auto-detect
+                                </span>
                             </div>
-                            
-                            <div className="p-6">
+                            <div className="p-5">
                                 <textarea
                                     rows={18}
                                     placeholder="วางข้อมูลโปรโมชั่นที่นี่..."
                                     value={rawInput}
-                                    onChange={(e) => setRawInput(e.target.value)}
-                                    className="w-full p-5 border border-slate-200 rounded-2xl bg-slate-50 font-mono text-xs focus:ring-4 focus:ring-emerald-500/5 focus:border-emerald-500 outline-none transition-all resize-none shadow-inner"
+                                    onChange={e => setRawInput(e.target.value)}
+                                    className="w-full rounded-xl border border-white/[0.08] bg-[#0d0f12] p-4 font-mono-custom text-xs text-white/60 placeholder:text-white/20 outline-none focus:border-emerald-500/30 focus:bg-[#0f1114] transition-all resize-none"
                                 />
-                                
-                                <div className="mt-6 flex flex-col gap-3">
-                                    <button 
+                                <div className="mt-4 flex flex-col gap-2.5">
+                                    <button
                                         onClick={handleProcess}
-                                        className="w-full py-4 bg-slate-800 hover:bg-slate-900 text-white font-bold rounded-2xl shadow-lg transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+                                        className="relative w-full overflow-hidden rounded-xl border border-emerald-500/20 bg-emerald-500/10 py-3.5 font-mono-custom text-xs font-bold tracking-[0.2em] text-emerald-400 transition-all hover:bg-emerald-500/20 hover:border-emerald-500/40 flex items-center justify-center gap-2"
                                     >
-                                        <Settings size={18} className="animate-spin-slow" /> Process Intelligence
+                                        <Settings size={14} /> PROCESS INTELLIGENCE
+                                        <div className="absolute bottom-0 left-0 h-[1px] w-full bg-gradient-to-r from-transparent via-emerald-400/40 to-transparent" />
                                     </button>
-                                    <button 
+                                    <button
                                         onClick={handleClear}
-                                        className="w-full py-3 bg-white border border-slate-200 hover:bg-red-50 hover:text-red-600 text-slate-400 font-bold rounded-xl transition-all text-xs uppercase tracking-tighter"
+                                        className="w-full rounded-xl border border-white/[0.06] bg-white/[0.03] py-2.5 font-mono-custom text-[11px] tracking-widest text-white/25 transition-all hover:border-red-500/20 hover:bg-red-500/5 hover:text-red-400 flex items-center justify-center gap-2"
                                     >
-                                        <Trash2 size={14} className="inline mr-2" /> Clear All
+                                        <Trash2 size={12} /> CLEAR ALL
                                     </button>
                                 </div>
                             </div>
                         </div>
 
-                        {/* Status Widget */}
-                        <div className={`p-5 rounded-2xl border flex items-center gap-4 transition-all shadow-sm ${
-                            status.startsWith('✓') ? 'bg-emerald-50 border-emerald-100 text-emerald-700' : 'bg-white border-slate-200 text-slate-500'
-                        }`}>
-                            <div className={`p-2 rounded-xl ${status.startsWith('✓') ? 'bg-emerald-100' : 'bg-slate-100'}`}>
-                                {status.startsWith('✓') ? <CheckCircle size={20} /> : <BarChart3 size={20} />}
+                        {/* Review badge */}
+                        {isProcessed && reviewCount > 0 && (
+                            <div className="fade-up rounded-2xl border border-amber-500/20 bg-amber-500/5 p-5 flex items-center gap-4">
+                                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-400">
+                                    <AlertTriangle size={18} />
+                                </div>
+                                <div>
+                                    <p className="font-mono-custom text-[10px] tracking-[0.2em] text-amber-400/60">NEEDS REVIEW</p>
+                                    <p className="font-display text-2xl font-extrabold text-amber-400 leading-none mt-0.5">
+                                        {reviewCount} <span className="text-sm font-normal text-amber-400/60">รายการ</span>
+                                    </p>
+                                </div>
                             </div>
-                            <div>
-                                <p className="text-[10px] uppercase font-bold opacity-50 tracking-widest leading-none mb-1">System Status</p>
-                                <p className="text-sm font-bold leading-none">{status}</p>
+                        )}
+
+                        {/* Legend cards */}
+                        {[
+                            { icon: AlertTriangle, color: 'text-amber-400', border: 'border-amber-500/15', bg: 'bg-amber-500/5', title: 'Validation', desc: 'ตรวจสอบหาก Legacy ID หรือ Offering Name หาย' },
+                            { icon: CheckCircle, color: 'text-emerald-400', border: 'border-emerald-500/15', bg: 'bg-emerald-500/5', title: 'Smart Format', desc: 'Rental Fee 6 ตำแหน่ง · วันที่ไทย → DD/MM/YYYY' },
+                            { icon: Search, color: 'text-sky-400', border: 'border-sky-500/15', bg: 'bg-sky-500/5', title: 'Editable', desc: 'คลิกเซลล์เพื่อแก้ไขก่อน export' },
+                        ].map((item, i) => (
+                            <div key={i} className={`rounded-xl border ${item.border} ${item.bg} p-4 flex items-start gap-3`}>
+                                <item.icon size={14} className={`${item.color} mt-0.5 shrink-0`} />
+                                <div>
+                                    <p className={`font-mono-custom text-[10px] font-bold tracking-widest ${item.color}`}>{item.title.toUpperCase()}</p>
+                                    <p className="mt-0.5 font-mono-custom text-[11px] text-white/30 leading-relaxed">{item.desc}</p>
+                                </div>
                             </div>
-                        </div>
+                        ))}
                     </div>
 
-                    {/* Right: Results Section */}
-                    <div className="lg:col-span-8">
+                    {/* RIGHT — Results */}
+                    <div className="fade-up lg:col-span-8" style={{ animationDelay: '140ms' }}>
                         {!isProcessed ? (
-                            <div className="h-[750px] bg-white rounded-[2rem] border border-dashed border-slate-300 flex flex-col items-center justify-center text-slate-400 space-y-4">
-                                <div className="p-6 bg-slate-50 rounded-full">
-                                    <Search size={48} strokeWidth={1} />
+                            <div className="flex h-[680px] flex-col items-center justify-center rounded-2xl border border-dashed border-white/[0.06] text-center">
+                                <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-white/20">
+                                    <Terminal size={24} strokeWidth={1.5} />
                                 </div>
-                                <div className="text-center">
-                                    <p className="font-bold text-slate-600">No Data Processed</p>
-                                    <p className="text-xs max-w-[250px] mt-2 opacity-60 leading-relaxed">ข้อมูลที่ประมวลผลแล้วจะปรากฏที่นี่ในรูปแบบตารางพร้อมส่งออกเป็น CSV</p>
-                                </div>
+                                <p className="font-display text-lg font-bold text-white/25">No Data Processed</p>
+                                <p className="mt-1 font-mono-custom text-[11px] text-white/15">วางข้อมูลแล้วกด Process Intelligence</p>
                             </div>
                         ) : (
-                            <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden flex flex-col h-[750px] animate-in fade-in slide-in-from-bottom-4 duration-500">
-                                <div className="p-6 border-b border-slate-50 bg-slate-50/50 flex items-center justify-between">
+                            <div className="flex flex-col overflow-hidden rounded-2xl border border-white/10 h-[680px]">
+                                {/* Table topbar */}
+                                <div className="flex items-center justify-between bg-[#0d0f12] px-6 py-4 border-b border-white/[0.06]">
                                     <div className="flex items-center gap-3">
-                                        <div className="p-2 bg-emerald-100 text-emerald-700 rounded-xl">
-                                            <FileText size={20} />
+                                        <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-emerald-500/20 bg-emerald-500/10 text-emerald-400">
+                                            <FileText size={14} />
                                         </div>
                                         <div>
-                                            <h2 className="font-black text-slate-700 text-sm uppercase tracking-widest leading-none">Extracted Dataset</h2>
-                                            <p className="text-[10px] text-slate-400 mt-1 font-bold">{extractedDataList.length} รายการที่สกัดได้</p>
+                                            <p className="font-mono-custom text-[11px] tracking-widest text-white/60">EXTRACTED DATASET</p>
+                                            <p className="font-mono-custom text-[10px] text-white/25">{dataList.length} รายการ · คลิกเซลล์เพื่อแก้ไข</p>
                                         </div>
                                     </div>
-                                    <button 
-                                        onClick={handleDownload}
-                                        className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition-all shadow-md active:scale-95"
-                                    >
-                                        <Download size={14} /> Export CSV
-                                    </button>
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            onClick={handleDownloadCSV}
+                                            className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-4 py-2 font-mono-custom text-[11px] tracking-widest text-white/40 transition-all hover:border-white/20 hover:text-white/70"
+                                        >
+                                            <Download size={12} /> CSV
+                                        </button>
+                                        <button
+                                            onClick={handleDownloadXLSX}
+                                            className="flex items-center gap-1.5 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-2 font-mono-custom text-[11px] tracking-widest text-emerald-400 transition-all hover:bg-emerald-500/20"
+                                        >
+                                            <FileSpreadsheet size={12} /> XLSX
+                                        </button>
+                                    </div>
                                 </div>
 
-                                <div className="flex-1 overflow-auto bg-white custom-scrollbar">
-                                    <table className="w-full text-left border-separate border-spacing-0">
-                                        <thead className="sticky top-0 z-10">
-                                            <tr className="bg-slate-800 text-white text-[10px] uppercase tracking-wider">
-                                                {OUTPUT_COLUMNS.map((col) => (
-                                                    <th key={col} className="px-5 py-4 border-r border-slate-700 whitespace-nowrap font-bold first:rounded-tl-none last:rounded-tr-none">
+                                {/* Table */}
+                                <div className="flex-1 overflow-auto bg-[#0a0c0f]">
+                                    <table className="w-full border-collapse text-left">
+                                        <thead className="sticky top-0 z-10 bg-[#0d0f12]">
+                                            <tr className="border-b border-white/[0.06]">
+                                                <th className="px-3 py-3 font-mono-custom text-[10px] tracking-[0.15em] text-white/20 w-10">#</th>
+                                                {OUTPUT_COLUMNS.map(col => (
+                                                    <th key={col} className="px-4 py-3 font-mono-custom text-[10px] tracking-[0.12em] text-white/30 whitespace-nowrap">
                                                         {col}
                                                     </th>
                                                 ))}
+                                                <th className="px-3 py-3 font-mono-custom text-[10px] text-white/20">DEL</th>
                                             </tr>
                                         </thead>
-                                        <tbody className="text-[11px] font-mono">
-                                            {extractedDataList.map((item, idx) => (
-                                                <tr key={idx} className={`group transition-colors ${item['⚠️ ตรวจสอบ?'] === 'ควรตรวจสอบ' ? 'bg-amber-50 hover:bg-amber-100/50' : 'hover:bg-slate-50/80'}`}>
-                                                    {OUTPUT_COLUMNS.map((col) => {
-                                                        const val = item[col as keyof ExtractedData];
+                                        <tbody>
+                                            {dataList.map((item, idx) => (
+                                                <tr
+                                                    key={idx}
+                                                    className={`group border-b border-white/[0.04] transition-colors ${item['⚠️ ตรวจสอบ?'] === 'ควรตรวจสอบ' ? 'bg-amber-500/[0.04] hover:bg-amber-500/[0.07]' : 'hover:bg-white/[0.025]'}`}
+                                                >
+                                                    <td className="px-3 py-2.5 font-mono-custom text-[10px] text-white/20 text-center">{idx + 1}</td>
+                                                    {OUTPUT_COLUMNS.map(col => {
+                                                        const val = item[col] || '';
+                                                        const isEditing = editCell?.row === idx && editCell?.col === col;
                                                         const needsReview = col === '⚠️ ตรวจสอบ?' && val === 'ควรตรวจสอบ';
                                                         return (
-                                                            <td key={col} className={`px-5 py-3 border-b border-r border-slate-100 whitespace-nowrap transition-all ${needsReview ? 'text-amber-600 font-bold bg-amber-100/30' : 'text-slate-500 group-hover:text-slate-900'}`}>
-                                                                {val || '-'}
+                                                            <td
+                                                                key={col}
+                                                                className={`px-4 py-2.5 font-mono-custom text-[11px] whitespace-nowrap border-r border-white/[0.03] cursor-pointer transition-colors
+                                  ${needsReview ? 'text-amber-400 font-bold bg-amber-500/10' : 'text-white/40 group-hover:text-white/70'}`}
+                                                                onClick={() => { if (col !== '⚠️ ตรวจสอบ?') { setEditCell({ row: idx, col }); setTimeout(() => editRef.current?.focus(), 50); } }}
+                                                            >
+                                                                {isEditing ? (
+                                                                    <input
+                                                                        ref={editRef}
+                                                                        defaultValue={val}
+                                                                        className="min-w-[120px] w-full rounded-lg border border-emerald-500/40 bg-[#0d0f12] px-2 py-1 text-[11px] text-emerald-300 outline-none ring-1 ring-emerald-500/20"
+                                                                        onBlur={e => { handleCellEdit(idx, col, e.target.value); setEditCell(null); }}
+                                                                        onKeyDown={e => {
+                                                                            if (e.key === 'Enter') { handleCellEdit(idx, col, (e.target as HTMLInputElement).value); setEditCell(null); }
+                                                                            if (e.key === 'Escape') setEditCell(null);
+                                                                        }}
+                                                                    />
+                                                                ) : (
+                                                                    val || <span className="text-white/15">—</span>
+                                                                )}
                                                             </td>
                                                         );
                                                     })}
+                                                    <td className="px-3 py-2.5 text-center">
+                                                        <button
+                                                            onClick={() => handleDeleteRow(idx)}
+                                                            className="rounded-lg p-1 text-white/15 transition-all hover:bg-red-500/10 hover:text-red-400"
+                                                        >
+                                                            <X size={11} />
+                                                        </button>
+                                                    </td>
                                                 </tr>
                                             ))}
                                         </tbody>
                                     </table>
                                 </div>
-                                
-                                <div className="p-4 bg-slate-900 text-[10px] text-slate-400 flex justify-between font-bold tracking-widest">
-                                    <span>DATA INTEGRITY CHECK: PASSED</span>
-                                    {reviewCount > 0 && <span className="text-amber-400 flex items-center gap-1"><AlertTriangle size={10}/> NEEDS REVIEW: {reviewCount}</span>}
+
+                                {/* Footer bar */}
+                                <div className="flex items-center justify-between bg-[#0d0f12] px-6 py-3 border-t border-white/[0.06]">
+                                    <div className="flex items-center gap-2">
+                                        <div className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                                        <span className="font-mono-custom text-[10px] tracking-[0.2em] text-white/25">DATA INTEGRITY CHECK: PASSED</span>
+                                    </div>
+                                    {reviewCount > 0 && (
+                                        <span className="flex items-center gap-1.5 font-mono-custom text-[10px] tracking-widest text-amber-400/70">
+                                            <AlertTriangle size={10} /> NEEDS REVIEW: {reviewCount}
+                                        </span>
+                                    )}
                                 </div>
                             </div>
                         )}
                     </div>
                 </div>
 
-                {/* Legend Section */}
-                <div className="mt-10 grid grid-cols-1 md:grid-cols-3 gap-6">
-                    {[
-                        { icon: AlertTriangle, color: 'text-amber-500', bg: 'bg-amber-50', title: 'Validation Alert', desc: 'ทำเครื่องหมาย "ควรตรวจสอบ" หาก Legacy ID หรือ Offer Name ขาดหาย' },
-                        { icon: CheckCircle, color: 'text-emerald-500', bg: 'bg-emerald-50', title: 'Smart Formatting', desc: 'ข้อมูล Rental Fee จะถูกแปลงเป็นทศนิยม 6 ตำแหน่ง (Billing Standard)' },
-                        { icon: Search, color: 'text-blue-500', bg: 'bg-blue-50', title: 'Multi-Format', desc: 'รองรับข้อมูลจาก Email, Excel (Tab-Separated) และระบบหลังบ้าน' }
-                    ].map((item, i) => (
-                        <div key={i} className="flex items-start gap-4 p-5 bg-white rounded-2xl border border-slate-200 shadow-sm transition-transform hover:-translate-y-1">
-                            <div className={`p-3 rounded-xl ${item.bg} ${item.color} shrink-0`}>
-                                <item.icon size={20} />
-                            </div>
-                            <div>
-                                <h4 className="text-xs font-black text-slate-800 uppercase tracking-widest mb-1">{item.title}</h4>
-                                <p className="text-[10px] text-slate-500 leading-relaxed font-bold opacity-70">{item.desc}</p>
-                            </div>
-                        </div>
-                    ))}
-                </div>
-            </main>
-
-            {/* --- FOOTER --- */}
-            <footer className="py-12 text-center opacity-30 mt-10">
-                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.4em]">Internal Engineering Unit • Billone Professional Suite</p>
-            </footer>
-
-            <style jsx global>{`
-                .custom-scrollbar::-webkit-scrollbar {
-                    width: 6px;
-                    height: 6px;
-                }
-                .custom-scrollbar::-webkit-scrollbar-track {
-                    background: transparent;
-                }
-                .custom-scrollbar::-webkit-scrollbar-thumb {
-                    background: #e2e8f0;
-                    border-radius: 10px;
-                }
-                .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-                    background: #cbd5e1;
-                }
-                .animate-spin-slow {
-                    animation: spin 8s linear infinite;
-                }
-                @keyframes spin {
-                    from { transform: rotate(0deg); }
-                    to { transform: rotate(360deg); }
-                }
-            `}</style>
+                {/* ── FOOTER ── */}
+                <footer className="mt-20 border-t border-white/[0.05] pt-8 text-center">
+                    <p className="font-mono-custom text-[10px] tracking-[0.3em] text-white/15">
+                        ARM@MOS · BILLONE INTERNAL ANALYTICS SYSTEMS · © {new Date().getFullYear()}
+                    </p>
+                </footer>
+            </div>
         </div>
     );
 }
