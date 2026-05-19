@@ -182,6 +182,50 @@ export default function HomePage() {
           50% { opacity: 0; }
         }
         .blink { animation: blink 1s step-end infinite; }
+
+        /* ── FIXED LOOPING RUNNING PETS ANIMATION ── */
+        @keyframes walk-across {
+          0% { left: 100%; transform: translateX(0); }
+          100% { left: 0%; transform: translateX(-150px); } /* ป้องกันตัวละครหายไปแบบดื้อๆ */
+        }
+        @keyframes bobbing-fast {
+          0%, 100% { bottom: 4px; }
+          50% { bottom: 18px; }
+        }
+        @keyframes bobbing-slow {
+          0%, 100% { bottom: 4px; }
+          50% { bottom: 12px; }
+        }
+
+        /* ใช้ absolute จับแยกพิกัดเริ่มต้น ไม่ให้เกิดอาการกองกัน */
+        .pet-container {
+          position: absolute;
+          will-change: left;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+
+        .pet-1 {
+          animation: walk-across 15s linear infinite, bobbing-fast 0.35s ease-in-out infinite;
+          animation-delay: 0s;
+        }
+        .pet-2 {
+          animation: walk-across 20s linear infinite, bobbing-slow 0.45s ease-in-out infinite;
+          animation-delay: -3s;
+        }
+        .pet-3 {
+          animation: walk-across 12s linear infinite, bobbing-fast 0.3s ease-in-out infinite;
+          animation-delay: -6s;
+        }
+        .pet-4 {
+          animation: walk-across 25s linear infinite, bobbing-slow 0.5s ease-in-out infinite;
+          animation-delay: -10s;
+        }
+        .pet-5 {
+          animation: walk-across 17s linear infinite, bobbing-fast 0.4s ease-in-out infinite;
+          animation-delay: -13s;
+        }
       `}</style>
 
       {/* Animated dot grid */}
@@ -233,7 +277,7 @@ export default function HomePage() {
             {[
               { val: '6', label: 'Tools' },
               { val: '100%', label: 'Internal' },
-              { val: 'v2.0', label: 'Version' },
+              { val: 'Arm_MosRTC', label: 'Version' },
             ].map(s => (
               <div key={s.label} className="text-center">
                 <div className="font-display text-2xl font-extrabold text-white">{s.val}</div>
@@ -256,8 +300,38 @@ export default function HomePage() {
           </div>
         </section>
 
+        {/* ── CUTENESS ZONE (THE MULTIPLE LOOPS RUNNING MULTIPARTY - FIXED) ── */}
+        <div className="pointer-events-none relative mt-24 h-32 w-full overflow-hidden border-b-2 border-dashed border-white/5">
+          
+          {/* ตัวที่ 1: น้องแมวดำ */}
+          <div className="pet-container pet-1 text-6xl filter drop-shadow-[0_0_12px_rgba(52,211,153,0.5)]">
+            🐈‍⬛
+          </div>
+
+          {/* ตัวที่ 2: น้องไดโนเสาร์ */}
+          <div className="pet-container pet-2 text-5xl filter drop-shadow-[0_0_12px_rgba(45,212,191,0.5)]">
+            🦖
+          </div>
+
+          {/* ตัวที่ 3: น้องหมาหน้ามึน */}
+          <div className="pet-container pet-3 text-5xl filter drop-shadow-[0_0_12px_rgba(251,191,36,0.4)]">
+            🐕
+          </div>
+
+          {/* ตัวที่ 4: น้องกระต่าย */}
+          <div className="pet-container pet-4 text-5xl filter drop-shadow-[0_0_12px_rgba(244,63,94,0.4)]">
+            🐇
+          </div>
+
+          {/* ตัวที่ 5: เจ้าจิ้งจอก */}
+          <div className="pet-container pet-5 text-5xl filter drop-shadow-[0_0_12px_rgba(99,102,241,0.4)]">
+            🦊
+          </div>
+
+        </div>
+
         {/* ── FOOTER ── */}
-        <footer className="mt-24 border-t border-white/[0.06] pt-10">
+        <footer className="mt-6 border-t border-white/[0.06] pt-10">
           <div className="flex flex-col items-center gap-3 text-center">
             <div className="flex items-center gap-3">
               <div className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
