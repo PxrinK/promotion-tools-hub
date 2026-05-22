@@ -74,7 +74,7 @@ const tools: ToolCardProps[] = [
     description: 'ระบบสรุปหมายเลขพิเศษจากไฟล์ข้อมูลต่างๆ',
     href: '/summaryspecialnumber',
     icon: Shuffle,
-    index: 6,
+    index: 7,
     tag: 'RELATE'
   },
 ];
