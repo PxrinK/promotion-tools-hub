@@ -68,6 +68,15 @@ const tools: ToolCardProps[] = [
     index: 6,
     tag: 'RELATE'
   },
+    {
+    title: 'summaryspecialnumber',
+    titleThai: 'สรุปหมายเลขพิเศษ',
+    description: 'ระบบสรุปหมายเลขพิเศษจากไฟล์ข้อมูลต่างๆ',
+    href: '/summaryspecialnumber',
+    icon: Shuffle,
+    index: 6,
+    tag: 'RELATE'
+  },
 ];
 
 const ToolCard = ({ title, titleThai, description, href, icon: Icon, index, tag }: ToolCardProps) => {
