@@ -146,28 +146,44 @@ export default function RelationshipManager() {
 
   const handleExport = useCallback(() => {
     if (!filteredData.length) return;
-    const wb = XLSX.utils.book_new();
-    const primaryId = filters['Primary Offering']?.[0] || filteredData[0]['Primary Offering'] || 'Data';
 
-    const wsDependent = XLSX.utils.aoa_to_sheet([['Master Id', 'Master Name', 'Slave Id', 'Slave Name', 'Relation Type', 'Control Flag']]);
-    applyExcelStyles(wsDependent);
-    XLSX.utils.book_append_sheet(wb, wsDependent, 'Dependent');
+    // 1. เช็คว่าผู้ใช้กำลังสนใจคอลัมน์ไหนเป็นหลัก (ถ้ากรอง Attached อยู่ ให้ใช้ Attached ไม่งั้นใช้ Primary)
+    const activeAttachedIds = filters['Attached Offering'] || [];
+    const groupColumn = activeAttachedIds.length > 0 ? 'Attached Offering' : 'Primary Offering';
 
-    const wsAttached = XLSX.utils.json_to_sheet(filteredData.map(row => ({
-      'Depended By ID': String(row['Primary Offering']),
-      'Depended By Name': row['PO'],
-      'Depend Id': String(row['Attached Offering']),
-      'Depend Name': row['SO'],
-      'Relation Type': 'O',
-    })));
-    applyExcelStyles(wsAttached);
-    XLSX.utils.book_append_sheet(wb, wsAttached, 'Attached');
+    // 2. ดึงเลข ID ที่ไม่ซ้ำกันทั้งหมดจากข้อมูลที่แสดงอยู่บนตาราง
+    const uniqueIds = Array.from(
+      new Set(filteredData.map(row => String(row[groupColumn])).filter(Boolean))
+    );
 
-    const wsReplacement = XLSX.utils.aoa_to_sheet([['Offering Id', 'Offering Name', 'Replace Offering Id', 'Replace Offering Name', 'Replace Type', 'Replace Rule', 'Effect Mode', 'Contract Continue', 'Plan']]);
-    applyExcelStyles(wsReplacement);
-    XLSX.utils.book_append_sheet(wb, wsReplacement, 'Replacement');
+    // 3. วนลูปสร้างไฟล์ตามจำนวน ID ที่มี
+    uniqueIds.forEach(id => {
+      const wb = XLSX.utils.book_new();
 
-    XLSX.writeFile(wb, `ALLRelations_${primaryId}.xlsx`);
+      // 4. *** สำคัญมาก *** กรองข้อมูลให้เหลือแค่ของ ID ปัจจุบันในลูป เพื่อไม่ให้ข้อมูลโปรอื่นไปปนในไฟล์
+      const targetData = filteredData.filter(row => String(row[groupColumn]) === id);
+
+      const wsDependent = XLSX.utils.aoa_to_sheet([['Master Id', 'Master Name', 'Slave Id', 'Slave Name', 'Relation Type', 'Control Flag']]);
+      applyExcelStyles(wsDependent);
+      XLSX.utils.book_append_sheet(wb, wsDependent, 'Dependent');
+
+      const wsAttached = XLSX.utils.json_to_sheet(targetData.map(row => ({
+        'Depended By ID': String(row['Primary Offering']),
+        'Depended By Name': row['PO'],
+        'Depend Id': String(row['Attached Offering']),
+        'Depend Name': row['SO'],
+        'Relation Type': 'O',
+      })));
+      applyExcelStyles(wsAttached);
+      XLSX.utils.book_append_sheet(wb, wsAttached, 'Attached');
+
+      const wsReplacement = XLSX.utils.aoa_to_sheet([['Offering Id', 'Offering Name', 'Replace Offering Id', 'Replace Offering Name', 'Replace Type', 'Replace Rule', 'Effect Mode', 'Contract Continue', 'Plan']]);
+      applyExcelStyles(wsReplacement);
+      XLSX.utils.book_append_sheet(wb, wsReplacement, 'Replacement');
+
+      // 5. สั่งดาวน์โหลดไฟล์โดยตั้งชื่อตาม ID นั้นๆ
+      XLSX.writeFile(wb, `ALLRelations_${id}.xlsx`);
+    });
   }, [filteredData, filters]);
 
   return (
