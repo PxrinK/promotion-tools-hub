@@ -284,7 +284,7 @@ export default function HomePage() {
           {/* Stats row */}
           <div className="hero-line mt-12 flex justify-center gap-12" style={{ animationDelay: '200ms' }}>
             {[
-              { val: '6', label: 'Tools' },
+              { val: '7', label: 'Tools' },
               { val: '100%', label: 'Internal' },
               { val: 'Arm_MosRTC', label: 'Version' },
             ].map(s => (
