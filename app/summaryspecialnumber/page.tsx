@@ -2,14 +2,31 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import ExcelJS from 'exceljs';
-import { ArrowLeft, FileSpreadsheet, Upload, Download, Loader2, CheckCircle, Info, X } from 'lucide-react';
+import { ArrowLeft, FileSpreadsheet, Upload, Download, Loader2, CheckCircle, Info, X, Calendar } from 'lucide-react';
+
+// รายชื่อเดือนภาษาไทยสำหรับแสดงผลใน UI และไฟล์ Excel
+const MONTHS_TH = [
+  'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
+  'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'
+];
 
 export default function SummarySpecialNumber() {
   const [file1, setFile1] = useState<File | null>(null);
   const [file2, setFile2] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isDone, setIsDone] = useState(false);
+  
+  // เพิ่ม State สำหรับเลือก เดือน และ ปี
+  const currentYear = new Date().getFullYear() + 543; // ดึงปี พ.ศ. ปัจจุบันเป็นค่าเริ่มต้น
+  const currentMonth = new Date().getMonth(); // ดึงเดือนปัจจุบัน (0-11)
+  
+  const [selectedMonth, setSelectedMonth] = useState<number>(currentMonth);
+  const [selectedYear, setSelectedYear] = useState<number>(currentYear);
+  
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // สร้างรายการปี พ.ศ. ย้อนหลัง 5 ปี และล่วงหน้า 2 ปี เพื่อให้เลือก
+  const yearOptions = Array.from({ length: 8 }, (_, i) => currentYear - 5 + i);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -68,11 +85,17 @@ export default function SummarySpecialNumber() {
       const newWorkbook = new ExcelJS.Workbook();
       const summaryData: any[] = [];
 
+      // 1. จัดการชีท TOTAL
       const wsTotal = newWorkbook.addWorksheet('TOTAL');
       wsTotal.addRow(['รายงานการใช้บริการเสริมแยกตามผู้ให้บริการ']);
-      wsTotal.addRow(['ประจำเดือน เมษายน 2026']);
+      wsTotal.addRow([`ประจำเดือน ${MONTHS_TH[selectedMonth]} ${selectedYear}`]);
       wsTotal.addRow([]);
-      wsTotal.addRow(['Sheet Name', 'Amount (exc VAT)', 'Share CP', 'Share CAT']);
+      
+      const headerRowTotal = wsTotal.addRow(['Sheet Name', 'Amount (exc VAT)', 'Share CP', 'Share CAT']);
+      // ปรับให้ Header ของหน้า TOTAL เป็นตัวหนา
+      headerRowTotal.eachCell((cell) => {
+        cell.font = { name: 'TH SarabunPSK', size: 16, bold: true };
+      });
 
       const wb2 = new ExcelJS.Workbook();
       await wb2.xlsx.load(await file2.arrayBuffer());
@@ -96,12 +119,29 @@ export default function SummarySpecialNumber() {
 
         if (rows.length > 1) {
           const newWs = newWorkbook.addWorksheet(ws.name);
-          rows.forEach(r => newWs.addRow(r));
+          
+          // เพิ่มข้อมูลแถว รวมถึงแถวหัวข้อ (Row 1)
+          rows.forEach((r, idx) => {
+            const addedRow = newWs.addRow(r);
+            // ปรับแถวหัวข้อ (Row แรกสุดของแต่ละคอลัมน์) ให้เป็นตัวหนาตามรูปภาพตัวอย่าง
+            if (idx === 0) {
+              addedRow.eachCell((cell) => {
+                cell.font = { name: 'TH SarabunPSK', size: 16, bold: true };
+              });
+            }
+          });
 
-          const footerRow = newWs.addRow(['', '', '', '', sAmt, sCP, sCAT]);
-          [5, 6, 7].forEach(i => {
-            const cell = footerRow.getCell(i);
-            cell.numFmt = '#,##0.00';
+          // แถวผลรวมท้ายชีทของแต่ละดีลเลอร์
+          const footerRow = newWs.addRow(['รวม (Total)', '', '', '', sAmt, sCP, sCAT]);
+          
+          // กำหนด Format และปรับตัวเลขผลรวมท้ายชีทให้เป็น "ตัวหนา"
+          footerRow.eachCell((cell, colNumber) => {
+            if (colNumber >= 1) {
+              cell.font = { name: 'TH SarabunPSK', size: 16, bold: true }; // ทำเป็นตัวหนาทั้งแถวสรุป
+            }
+            if (colNumber === 5 || colNumber === 6 || colNumber === 7) {
+              cell.numFmt = '#,##0.00';
+            }
             cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
           });
 
@@ -109,11 +149,13 @@ export default function SummarySpecialNumber() {
         }
       });
 
+      // ใส่ข้อมูลในชีท TOTAL
       summaryData.forEach(d => {
         const row = wsTotal.addRow([d.name, d.amt, d.cp, d.cat]);
         [2, 3, 4].forEach(i => row.getCell(i).numFmt = '#,##0.00');
       });
 
+      // คำนวณบรรทัด รวม (Total) ของชีท TOTAL
       const lastRow = wsTotal.rowCount;
       if (lastRow > 4) {
         const sumRow = wsTotal.addRow(['รวม (Total)',
@@ -121,17 +163,36 @@ export default function SummarySpecialNumber() {
           { formula: `SUM(C5:C${lastRow})` },
           { formula: `SUM(D5:D${lastRow})` }
         ]);
-        [2, 3, 4].forEach(i => sumRow.getCell(i).numFmt = '#,##0.00');
+        
+        // กำหนดให้ตัวเลขผลรวมผลลัพธ์ในชีท TOTAL เป็น "ตัวหนา" ทั้งหมด
+        sumRow.eachCell((cell, colNumber) => {
+          cell.font = { name: 'TH SarabunPSK', size: 16, bold: true };
+          if (colNumber >= 2 && colNumber <= 4) {
+            cell.numFmt = '#,##0.00';
+          }
+        });
       }
 
+      // จัดการชีท Non_Charge
       const wsNC = newWorkbook.addWorksheet('Non_Charge');
-      wb1.worksheets[0].eachRow(row => { wsNC.addRow(row.values); });
+      wb1.worksheets[0].eachRow((row, rowNumber) => { 
+        const addedRow = wsNC.addRow(row.values); 
+        // ทำหัวข้อคอลัมน์ของชีท Non_Charge เป็นตัวหนาด้วยเช่นกัน
+        if (rowNumber === 1) {
+          addedRow.eachCell((cell) => {
+            cell.font = { name: 'TH SarabunPSK', size: 16, bold: true };
+          });
+        }
+      });
 
+      // วนลูปเก็บรายละเอียดฟอนต์และเส้นขอบพื้นฐาน (ไม่ให้เขียนทับค่าตัวหนาที่เซ็ตไว้ก่อนหน้า)
       newWorkbook.eachSheet(ws => {
-        ws.eachRow(row => {
+        ws.eachRow((row, rowIdx) => {
           row.eachCell(cell => {
             if (cell.value !== null && cell.value !== '' && cell.value !== undefined) {
-              cell.font = { name: 'TH SarabunPSK', size: 16 };
+              // ตรวจสอบว่าถ้าเซลล์นั้นถูกตั้งค่า bold ไว้แล้ว ให้คงค่าเดิมไว้ (ไม่ไปทับให้กลายเป็นตัวบาง)
+              const isBold = cell.font && cell.font.bold;
+              cell.font = { name: 'TH SarabunPSK', size: 16, bold: isBold };
               cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
             }
           });
@@ -142,7 +203,7 @@ export default function SummarySpecialNumber() {
       const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       const a = document.createElement('a');
       a.href = window.URL.createObjectURL(blob);
-      a.download = 'Summary_Report_Final.xlsx';
+      a.download = `Summary_Report_${MONTHS_TH[selectedMonth]}_${selectedYear}.xlsx`;
       a.click();
       setIsDone(true);
     } catch (e) {
@@ -274,13 +335,8 @@ export default function SummarySpecialNumber() {
         }
       `}} />
 
-      {/* Dot Grid Background */}
       <canvas ref={canvasRef} className="pointer-events-none fixed inset-0 z-0" />
-
-      {/* Scan Line */}
       <div className="scan-line pointer-events-none fixed left-0 top-0 z-10 h-[2px] w-full bg-gradient-to-r from-transparent via-emerald-400/20 to-transparent" />
-
-      {/* Ambient vignette */}
       <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(ellipse_80%_60%_at_50%_0%,rgba(16,185,129,0.05),transparent)] z-0" />
 
       <div className="relative z-10">
@@ -289,7 +345,6 @@ export default function SummarySpecialNumber() {
         <header className="bg-white/[0.02] border-b border-white/[0.06] py-10 px-8 backdrop-blur-sm">
           <div className="max-w-[860px] mx-auto relative flex flex-col items-center">
 
-            {/* Back Button */}
             <div className="absolute top-0 left-0">
               <a
                 href="/mainocs"
@@ -302,7 +357,6 @@ export default function SummarySpecialNumber() {
               </a>
             </div>
 
-            {/* Title */}
             <div className="text-center pt-10 md:pt-0">
               <div className="inline-flex items-center justify-center p-3.5 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl shadow-lg mb-4 text-emerald-400">
                 <FileSpreadsheet size={28} />
@@ -319,6 +373,48 @@ export default function SummarySpecialNumber() {
 
         {/* ── MAIN ── */}
         <main className="max-w-[860px] mx-auto px-8 py-12 space-y-8">
+
+          {/* เลือกช่วงเวลาของรายงาน */}
+          <section className="bg-white/[0.03] backdrop-blur-sm rounded-[2.5rem] border border-white/10 shadow-2xl overflow-hidden transition-all duration-300 hover:border-emerald-500/20">
+            <div className="p-8 border-b border-white/[0.04] bg-white/[0.01] flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-xl">
+                  <Calendar size={20} />
+                </div>
+                <h2 className="font-mono-custom text-xs font-bold text-white/80 uppercase tracking-widest">เลือกช่วงเวลาของรายงาน</h2>
+              </div>
+            </div>
+            
+            <div className="p-8 grid grid-cols-1 sm:grid-cols-2 gap-6">
+              {/* Dropdown เลือกเดือน */}
+              <div className="flex flex-col gap-2">
+                <label className="font-mono-custom text-[10px] text-white/40 uppercase tracking-widest font-black">เดือน (Month)</label>
+                <select
+                  value={selectedMonth}
+                  onChange={(e) => { setSelectedMonth(Number(e.target.value)); setIsDone(false); }}
+                  className="bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-500 transition-colors font-sans"
+                >
+                  {MONTHS_TH.map((month, idx) => (
+                    <option key={idx} value={idx} className="bg-[#0a0c0f] text-white">{month}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Dropdown เลือกปี */}
+              <div className="flex flex-col gap-2">
+                <label className="font-mono-custom text-[10px] text-white/40 uppercase tracking-widest font-black">ปี พ.ศ. (Year)</label>
+                <select
+                  value={selectedYear}
+                  onChange={(e) => { setSelectedYear(Number(e.target.value)); setIsDone(false); }}
+                  className="bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-emerald-500 transition-colors font-sans"
+                >
+                  {yearOptions.map((year) => (
+                    <option key={year} value={year} className="bg-[#0a0c0f] text-white">{year}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </section>
 
           {/* File Upload Section */}
           <section className="bg-white/[0.03] backdrop-blur-sm rounded-[2.5rem] border border-white/10 shadow-2xl overflow-hidden transition-all duration-300 hover:border-emerald-500/20">
@@ -349,7 +445,6 @@ export default function SummarySpecialNumber() {
               />
             </div>
 
-            {/* Status bar */}
             <div className="px-8 pb-8">
               <div className="flex items-center gap-3 p-4 rounded-2xl bg-black/30 border border-white/[0.06]">
                 <div className={`w-2 h-2 rounded-full transition-all ${file1 && file2 ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]' : 'bg-white/10'}`} />
@@ -406,7 +501,7 @@ export default function SummarySpecialNumber() {
               <div className="font-mono-custom text-[10px] text-white/50 leading-relaxed">
                 <span className="text-white font-bold block mb-1">ขั้นตอนการทำงาน:</span>
                 <span>ระบบจะอ่านหมายเลข Non_Charge และกรองออกจากข้อมูลหลัก จากนั้นสร้างชีทสรุปและคำนวณยอดรวมอัตโนมัติ</span>
-                <span className="block mt-1 text-emerald-400/70">Output: Summary_Report_Final.xlsx</span>
+                <span className="block mt-1 text-emerald-400/70">Output: Summary_Report_[เดือน]_[ปี].xlsx</span>
               </div>
             </div>
             <div className="flex items-start gap-4 p-6 bg-white/[0.02] border border-white/10 rounded-2xl backdrop-blur-sm">
@@ -416,7 +511,7 @@ export default function SummarySpecialNumber() {
               <div className="font-mono-custom text-[10px] text-white/50 leading-relaxed">
                 <span className="text-white font-bold block mb-1">รูปแบบไฟล์ที่รองรับ:</span>
                 <span>รองรับเฉพาะไฟล์ .xlsx และ .xls ผลลัพธ์จะมีชีท TOTAL, ชีทข้อมูลแต่ละ Provider และ Non_Charge</span>
-                <span className="block mt-1 text-teal-400/70">ฟอนต์: TH SarabunPSK ขนาด 16pt</span>
+                <span className="block mt-1 text-teal-400/70">ฟอนต์: TH SarabunPSK ขนาด 16pt (หัวข้อและผลรวมเป็นตัวหนา)</span>
               </div>
             </div>
           </div>
