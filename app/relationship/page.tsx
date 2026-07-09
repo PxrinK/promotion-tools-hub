@@ -20,11 +20,11 @@ interface FilterState {
 }
 
 const COLUMNS = [
-  { key: 'Primary Offering', label: 'Primary ID', width: '140px' },
-  { key: 'PO', label: 'Primary Name', width: '260px' },
+  { key: 'Primary Offering', label: 'Primary ID', width: '160px' },
+  { key: 'PO', label: 'Primary Name', width: '280px' },
   { key: 'PO STATUS', label: 'PO Status', width: '160px' },
-  { key: 'Attached Offering', label: 'Attached ID', width: '140px' },
-  { key: 'SO', label: 'Attached Name', width: '260px' },
+  { key: 'Attached Offering', label: 'Attached ID', width: '160px' },
+  { key: 'SO', label: 'Attached Name', width: '280px' },
   { key: 'SO STATUS', label: 'SO Status', width: '160px' },
 ];
 
@@ -36,22 +36,22 @@ const DataRow = memo(({ row }: { row: RowData }) => {
 
   return (
     <tr className="group border-b border-white/[0.04] transition-colors hover:bg-white/[0.025]">
-      <td className="px-6 py-3.5 font-mono-custom text-[11px] text-white/40">{row['Primary Offering']}</td>
-      <td className="px-6 py-3.5 font-mono-custom text-xs text-white/60 truncate max-w-[250px]" title={row['PO']}>{row['PO']}</td>
-      <td className="px-6 py-3.5">
+      <td className="px-6 py-4 font-mono-custom text-xs text-white/40">{row['Primary Offering']}</td>
+      <td className="px-6 py-4 font-mono-custom text-sm text-white/60 truncate max-w-[270px]" title={row['PO']}>{row['PO']}</td>
+      <td className="px-6 py-4">
         <div className="flex items-center gap-2 whitespace-nowrap">
           <div className={`h-1.5 w-1.5 rounded-full ${isApproved ? 'bg-emerald-400' : 'bg-white/20'}`} />
-          <span className={`font-mono-custom text-[11px] font-bold uppercase tracking-tight ${isApproved ? 'text-emerald-400' : 'text-white/30'}`}>
+          <span className={`font-mono-custom text-xs font-bold uppercase tracking-tight ${isApproved ? 'text-emerald-400' : 'text-white/30'}`}>
             {row['PO STATUS'] || '—'}
           </span>
         </div>
       </td>
-      <td className="px-6 py-3.5 font-mono-custom text-[11px] font-bold text-emerald-400/80">{row['Attached Offering']}</td>
-      <td className="px-6 py-3.5 font-mono-custom text-xs text-white/60 truncate max-w-[250px]" title={row['SO']}>{row['SO']}</td>
-      <td className="px-6 py-3.5">
+      <td className="px-6 py-4 font-mono-custom text-xs font-bold text-emerald-400/80">{row['Attached Offering']}</td>
+      <td className="px-6 py-4 font-mono-custom text-sm text-white/60 truncate max-w-[270px]" title={row['SO']}>{row['SO']}</td>
+      <td className="px-6 py-4">
         <div className="flex items-center gap-2 whitespace-nowrap">
           <div className="h-1.5 w-1.5 rounded-full bg-white/20" />
-          <span className="font-mono-custom text-[11px] font-bold text-white/30 uppercase tracking-tight">
+          <span className="font-mono-custom text-xs font-bold text-white/30 uppercase tracking-tight">
             {row['SO STATUS'] || '—'}
           </span>
         </div>
@@ -91,8 +91,12 @@ export default function RelationshipManager() {
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node))
-        setActiveFilterDropdown(null);
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        const target = e.target as HTMLElement;
+        if (!target.closest('.filter-btn')) {
+          setActiveFilterDropdown(null);
+        }
+      }
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -147,20 +151,15 @@ export default function RelationshipManager() {
   const handleExport = useCallback(() => {
     if (!filteredData.length) return;
 
-    // 1. เช็คว่าผู้ใช้กำลังสนใจคอลัมน์ไหนเป็นหลัก (ถ้ากรอง Attached อยู่ ให้ใช้ Attached ไม่งั้นใช้ Primary)
     const activeAttachedIds = filters['Attached Offering'] || [];
     const groupColumn = activeAttachedIds.length > 0 ? 'Attached Offering' : 'Primary Offering';
 
-    // 2. ดึงเลข ID ที่ไม่ซ้ำกันทั้งหมดจากข้อมูลที่แสดงอยู่บนตาราง
     const uniqueIds = Array.from(
       new Set(filteredData.map(row => String(row[groupColumn])).filter(Boolean))
     );
 
-    // 3. วนลูปสร้างไฟล์ตามจำนวน ID ที่มี
     uniqueIds.forEach(id => {
       const wb = XLSX.utils.book_new();
-
-      // 4. *** สำคัญมาก *** กรองข้อมูลให้เหลือแค่ของ ID ปัจจุบันในลูป เพื่อไม่ให้ข้อมูลโปรอื่นไปปนในไฟล์
       const targetData = filteredData.filter(row => String(row[groupColumn]) === id);
 
       const wsDependent = XLSX.utils.aoa_to_sheet([['Master Id', 'Master Name', 'Slave Id', 'Slave Name', 'Relation Type', 'Control Flag']]);
@@ -181,13 +180,12 @@ export default function RelationshipManager() {
       applyExcelStyles(wsReplacement);
       XLSX.utils.book_append_sheet(wb, wsReplacement, 'Replacement');
 
-      // 5. สั่งดาวน์โหลดไฟล์โดยตั้งชื่อตาม ID นั้นๆ
       XLSX.writeFile(wb, `ALLRelations_${id}.xlsx`);
     });
   }, [filteredData, filters]);
 
   return (
-    <div className="relative min-h-screen overflow-x-hidden bg-[#0a0c0f]">
+    <div className="relative min-h-screen bg-[#0a0c0f]">
       <style jsx global>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@700;800&display=swap');
         .font-display     { font-family: 'Syne', sans-serif; }
@@ -197,11 +195,11 @@ export default function RelationshipManager() {
         @keyframes scan { 0%{transform:translateY(-100%);opacity:0} 10%{opacity:1} 90%{opacity:1} 100%{transform:translateY(100vh);opacity:0} }
         .scan-line { animation: scan 8s ease-in-out infinite; }
         @keyframes scale-in { from { opacity:0; transform:scale(0.95); } to { opacity:1; transform:scale(1); } }
-        .scale-in { animation: scale-in 0.18s cubic-bezier(0.16,1,0.3,1) forwards; }
-        ::-webkit-scrollbar { width:5px; height:5px; }
+        .scale-in { animation: scale-in 0.15s cubic-bezier(0.16,1,0.3,1) forwards; }
+        ::-webkit-scrollbar { width:6px; height:6px; }
         ::-webkit-scrollbar-track { background:transparent; }
-        ::-webkit-scrollbar-thumb { background:rgba(52,211,153,0.2); border-radius:10px; }
-        ::-webkit-scrollbar-thumb:hover { background:rgba(52,211,153,0.4); }
+        ::-webkit-scrollbar-thumb { background:rgba(52,211,153,0.25); border-radius:10px; }
+        ::-webkit-scrollbar-thumb:hover { background:rgba(52,211,153,0.45); }
       `}</style>
 
       <canvas ref={canvasRef} className="pointer-events-none fixed inset-0" />
@@ -274,51 +272,68 @@ export default function RelationshipManager() {
         </div>
 
         {/* TABLE */}
-        <div className="fade-up overflow-hidden rounded-2xl border border-white/10" style={{ animationDelay: '140ms' }}>
-          <div className="overflow-x-auto" style={{ maxHeight: 'calc(100vh - 300px)' }}>
-            <table className="w-full border-collapse table-fixed text-left" style={{ minWidth: '1100px' }}>
-              <thead className="sticky top-0 z-20 bg-[#0d0f12]">
+        {/* นำ overflow-hidden ออกจากกรอบใหญ่เพื่อให้แสดง Dropdown ได้ทะลุขอบล่างอย่างอิสระ */}
+        <div className="fade-up rounded-2xl border border-white/10 bg-[#0d0f12]" style={{ animationDelay: '140ms' }}>
+          <div className="overflow-x-auto rounded-2xl" style={{ minHeight: '500px', maxHeight: 'calc(100vh - 300px)' }}>
+            <table className="w-full border-collapse table-fixed text-left" style={{ minWidth: '1200px' }}>
+              <thead className="sticky top-0 z-30 bg-[#0d0f12]">
                 <tr className="border-b border-white/[0.06]">
-                  {COLUMNS.map(col => (
+                  {COLUMNS.map((col, index) => (
                     <th key={col.key} style={{ width: col.width }} className="relative px-6 py-4">
                       <div className="flex items-center justify-between gap-2">
-                        <span className="font-mono-custom text-[10px] tracking-[0.2em] text-white/30">{col.label}</span>
+                        <span className="font-mono-custom text-[11px] font-bold tracking-[0.15em] text-white/40">{col.label}</span>
                         <button
-                          onClick={() => { setActiveFilterDropdown(activeFilterDropdown === col.key ? null : col.key); setLocalSearch(''); }}
-                          className={`rounded-lg p-1.5 transition-all ${filters[col.key]?.length > 0 ? 'bg-emerald-500/20 text-emerald-400 ring-1 ring-emerald-500/30' : 'text-white/20 hover:bg-white/5 hover:text-white/50'}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setActiveFilterDropdown(activeFilterDropdown === col.key ? null : col.key); 
+                            setLocalSearch(''); 
+                          }}
+                          className={`filter-btn rounded-lg p-2 transition-all ${filters[col.key]?.length > 0 ? 'bg-emerald-500/20 text-emerald-400 ring-1 ring-emerald-500/30' : 'text-white/20 hover:bg-white/5 hover:text-white/50'}`}
                         >
-                          <Filter size={10} />
+                          <Filter size={12} />
                         </button>
                       </div>
 
                       {activeFilterDropdown === col.key && (
-                        <div ref={dropdownRef} className="scale-in absolute right-4 top-full z-50 mt-2 w-64 overflow-hidden rounded-xl border border-white/10 bg-[#0d0f12] shadow-2xl shadow-black/50">
-                          <div className="p-3 border-b border-white/[0.06]">
+                        /* ขยายขนาดกล่องเป็น w-80 (320px) และตัวเลือกภายในให้ใหญ่ขึ้นชัดเจน */
+                        <div 
+                          ref={dropdownRef} 
+                          onClick={(e) => e.stopPropagation()} 
+                          className={`scale-in absolute ${index < 2 ? 'left-4' : 'right-4'} top-[calc(100%-2px)] z-50 mt-2 w-80 max-h-[400px] flex flex-col overflow-hidden rounded-xl border border-white/10 bg-[#0d0f12] shadow-2xl shadow-black/80`}
+                        >
+                          <div className="p-3 border-b border-white/[0.06] shrink-0 bg-[#0f1216]">
                             <div className="relative">
-                              <Search size={11} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/25" />
+                              <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/25" />
                               <input
                                 autoFocus
                                 type="text"
-                                placeholder="Search..."
-                                className="w-full rounded-lg border border-white/10 bg-white/5 py-1.5 pl-8 pr-3 font-mono-custom text-[11px] text-white/50 outline-none placeholder:text-white/20 focus:border-emerald-500/30"
+                                placeholder="Search values..."
+                                className="w-full rounded-lg border border-white/10 bg-white/5 py-2 pl-9 pr-3 font-mono-custom text-xs text-white/70 outline-none placeholder:text-white/20 focus:border-emerald-500/40 focus:bg-white/[0.02]"
                                 value={localSearch}
                                 onChange={e => setLocalSearch(e.target.value)}
                               />
                             </div>
                           </div>
-                          <div className="max-h-48 overflow-y-auto p-2 space-y-0.5">
+                          <div className="flex-1 overflow-y-auto p-2 space-y-1 min-h-[0] bg-[#0d0f12]">
                             {(columnUniqueValues[col.key] || [])
                               .filter(opt => opt.toLowerCase().includes(localSearch.toLowerCase()))
                               .map(val => (
-                                <div key={val} onClick={() => toggleFilterValue(col.key, val)} className="flex cursor-pointer items-center gap-2.5 rounded-lg p-2 transition-colors hover:bg-white/5">
-                                  <div className={`flex h-3.5 w-3.5 items-center justify-center rounded border transition-all ${filters[col.key]?.includes(val) ? 'border-emerald-500 bg-emerald-500' : 'border-white/20'}`}>
-                                    {filters[col.key]?.includes(val) && <Check size={9} className="text-white" strokeWidth={3} />}
+                                <div 
+                                  key={val} 
+                                  onClick={(e) => {
+                                    e.stopPropagation(); 
+                                    toggleFilterValue(col.key, val);
+                                  }} 
+                                  className="flex cursor-pointer items-center gap-3 rounded-lg p-2.5 transition-colors hover:bg-white/5"
+                                >
+                                  <div className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-all ${filters[col.key]?.includes(val) ? 'border-emerald-500 bg-emerald-500' : 'border-white/20'}`}>
+                                    {filters[col.key]?.includes(val) && <Check size={11} className="text-white" strokeWidth={3} />}
                                   </div>
-                                  <span className="font-mono-custom text-[11px] text-white/50 truncate">{val}</span>
+                                  <span className="font-mono-custom text-sm font-medium text-white/60 truncate">{val}</span>
                                 </div>
                               ))}
                             {!(columnUniqueValues[col.key] || []).filter(opt => opt.toLowerCase().includes(localSearch.toLowerCase())).length && (
-                              <p className="py-3 text-center font-mono-custom text-[11px] text-white/20 italic">No options found</p>
+                              <p className="py-4 text-center font-mono-custom text-xs text-white/20 italic">No options found</p>
                             )}
                           </div>
                         </div>
@@ -338,7 +353,7 @@ export default function RelationshipManager() {
                           <Layers size={24} strokeWidth={1.5} />
                         </div>
                         <p className="font-display text-base font-bold text-white/25">No Records Available</p>
-                        <p className="mt-1 font-mono-custom text-[11px] text-white/15 max-w-xs text-center">
+                        <p className="mt-1 font-mono-custom text-xs text-white/15 max-w-xs text-center">
                           Import an Excel file to start managing promotion relationships
                         </p>
                         <button
@@ -358,7 +373,7 @@ export default function RelationshipManager() {
 
         <footer className="mt-16 border-t border-white/[0.05] pt-8 text-center">
           <p className="font-mono-custom text-[10px] tracking-[0.3em] text-white/15">
-            ARM@MOS · BILLONE INTERNAL ANALYTICS SYSTEMS · © {new Date().getFullYear()}
+            ARM@MOS · BILLONE INTERNAL ANALYTICS SYSTEMS · © 2026
           </p>
         </footer>
       </div>

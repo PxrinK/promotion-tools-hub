@@ -4,7 +4,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import ExcelJS from 'exceljs';
 import { ArrowLeft, FileSpreadsheet, Upload, Download, Loader2, CheckCircle, Info, X, Calendar } from 'lucide-react';
 
-// รายชื่อเดือนภาษาไทยสำหรับแสดงผลใน UI และไฟล์ Excel
 const MONTHS_TH = [
   'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
   'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'
