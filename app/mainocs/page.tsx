@@ -178,31 +178,65 @@ export default function HomePage() {
 
   const [tasks, setTasks] = useState<Task[]>([]);
   const [isMounted, setIsMounted] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  const DEFAULT_TASKS: Task[] = [
+    { id: '1', text: 'Config Promotion OCS ชุดใหม่', completed: false, priority: 'high', toolHref: '/extractor', createdAt: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' }) },
+    { id: '2', text: 'Mapping เบอร์โทรศัพท์ลูกค้า VIP', completed: false, priority: 'medium', toolHref: '/phonenumberreformatter', createdAt: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' }) },
+    { id: '3', text: 'ตรวจเช็กไฟล์ Prorate รอบบิลนี้', completed: true, priority: 'low', toolHref: '/prorate', createdAt: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' }) },
+  ];
+
+  // Everyone reads/writes the same key on the server, so tasks are
+  // shared across the whole team instead of being stuck per-browser.
+  const fetchTasks = async (seedIfEmpty = false) => {
+    try {
+      const res = await fetch('/api/tasks', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data: Task[] = await res.json();
+      if (seedIfEmpty && data.length === 0) {
+        setTasks(DEFAULT_TASKS);
+        await fetch('/api/tasks', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(DEFAULT_TASKS),
+        });
+      } else {
+        setTasks(data);
+      }
+    } catch (e) {
+      console.error('โหลดงานจากทีมไม่สำเร็จ', e);
+    }
+  };
+
+  // Push the full task list to the server so teammates see the change.
+  const persistTasks = async (updated: Task[]) => {
+    setTasks(updated);
+    setIsSyncing(true);
+    try {
+      await fetch('/api/tasks', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated),
+      });
+    } catch (e) {
+      console.error('บันทึกงานไปยังทีมไม่สำเร็จ', e);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
 
   useEffect(() => {
     setIsMounted(true);
-    const saved = localStorage.getItem('billone_tasks');
-    if (saved) {
-      try {
-        setTasks(JSON.parse(saved));
-        return;
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
-    setTasks([
-      { id: '1', text: 'Config Promotion OCS ชุดใหม่', completed: false, priority: 'high', toolHref: '/extractor', createdAt: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' }) },
-      { id: '2', text: 'Mapping เบอร์โทรศัพท์ลูกค้า VIP', completed: false, priority: 'medium', toolHref: '/phonenumberreformatter', createdAt: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' }) },
-      { id: '3', text: 'ตรวจเช็กไฟล์ Prorate รอบบิลนี้', completed: true, priority: 'low', toolHref: '/prorate', createdAt: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' }) },
-    ]);
+    fetchTasks(true);
+    // poll so changes made by teammates show up without a manual refresh
+    const interval = setInterval(() => fetchTasks(false), 6000);
+    return () => clearInterval(interval);
   }, []);
 
+  // grab the latest list the moment the drawer is opened
   useEffect(() => {
-    if (isMounted) {
-      localStorage.setItem('billone_tasks', JSON.stringify(tasks));
-    }
-  }, [tasks, isMounted]);
+    if (isTaskOpen) fetchTasks(false);
+  }, [isTaskOpen]);
 
   const activeTasksCount = tasks.filter(t => !t.completed).length;
   const completedTasksCount = tasks.filter(t => t.completed).length;
@@ -219,7 +253,7 @@ export default function HomePage() {
       toolHref: selectedToolHref || undefined,
       createdAt: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' })
     };
-    setTasks([newTask, ...tasks]);
+    persistTasks([newTask, ...tasks]);
     setNewTaskText('');
     setSelectedToolHref('');
   };
@@ -233,15 +267,15 @@ export default function HomePage() {
       toolHref: tmpl.toolHref,
       createdAt: new Date().toLocaleDateString('th-TH', { day: 'numeric', month: 'short' })
     };
-    setTasks([newTask, ...tasks]);
+    persistTasks([newTask, ...tasks]);
   };
 
   const toggleTask = (id: string) => {
-    setTasks(tasks.map(t => t.id === id ? { ...t, completed: !t.completed } : t));
+    persistTasks(tasks.map(t => t.id === id ? { ...t, completed: !t.completed } : t));
   };
 
   const deleteTask = (id: string) => {
-    setTasks(tasks.filter(t => t.id !== id));
+    persistTasks(tasks.filter(t => t.id !== id));
   };
 
   const copySummaryToClipboard = () => {
@@ -635,7 +669,10 @@ export default function HomePage() {
                 </div>
                 <div>
                   <h2 className="font-display text-xl font-bold text-white leading-tight">TASK.CTRL</h2>
-                  <p className="font-mono text-[10px] text-emerald-500/60 tracking-widest">งานคงค้างของหน่วยประมวลผล</p>
+                  <p className="font-mono text-[10px] text-emerald-500/60 tracking-widest flex items-center gap-1.5">
+                    <span className={`h-1.5 w-1.5 rounded-full ${isSyncing ? 'bg-amber-400 led' : 'bg-emerald-400'}`} />
+                    {isSyncing ? 'SYNCING...' : 'TEAM SHARED · LIVE'}
+                  </p>
                 </div>
               </div>
               <div className="flex items-center gap-2">
