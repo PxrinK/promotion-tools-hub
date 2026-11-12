@@ -1,1539 +1,1082 @@
 "use client";
 
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   FileText, GitCompare, Download, ArrowLeft,
-  Table as TableIcon, Settings2, Search, ArrowRightLeft,
-  CheckCircle2, AlertTriangle, PlusCircle, MinusCircle,
-  ClipboardPaste, Upload, Trash2, Key, SortAsc, Layers, Copy, Check, Eye
+  Search, ArrowRightLeft, CheckCircle2, AlertTriangle,
+  PlusCircle, MinusCircle, ClipboardPaste, Upload, Trash2,
+  Copy, Check, Sparkles, ShieldAlert, Clock, Filter
 } from 'lucide-react';
 import Link from 'next/link';
 import * as XLSX from 'xlsx';
+import {
+  compareScenarioReleases,
+  ScenarioDiffStatus,
+  CompositeKeyStrategy,
+  DiffEngineOptions,
+  AlignedScenarioRow,
+  RELEASE_TYPE_LABELS,
+} from '@/lib/scenarioDiffEngine';
 
-// --- TYPES ---
-type DiffStatus = 'match' | 'modified' | 'only_a' | 'only_b';
-type CompareMode = 'smart_align' | 'key_match' | 'line_by_line';
+const PAGE_SIZE = 200;
 
-interface AlignedRow {
-  index: number;
-  lineNumA: number | null;
-  lineNumB: number | null;
-  keyVal: string;
-  contentA: string;
-  contentB: string;
-  rawRowA?: any[];
-  rawRowB?: any[];
-  status: DiffStatus;
-  diffCols?: number[]; // indices of columns that differ when comparing full Excel rows
-}
+const SAMPLE_TB = `Counter|Scenario Name|Release Type(B: BE; R: Brand; P: Primary Offering; O: Supplementary Offering)|Release Object
+SO_Speed_30M|SCE_SO_PPS_30M_63210012|O|C_SO_63210012
+SFU_Speed_Max|SCE_SFU_4GMax|P|C_PO_51006670
+PO_Speed_2|SCE_PO_POS_10M|P|C_PO_52100117
+PO_Speed_2|SCE_PO_POS_20M|P|C_PO_52100118
+O_Dr_AWN_20M_64k|SCE_SO_PPS_20M_63210084_2|O|C_SO_63210084
+SO_Social_Unlim|SCE_SO_SOCIAL_99|O|C_SO_63210099`;
 
-interface CompareSummary {
-  totalAligned: number;
-  matchCount: number;
-  modifiedCount: number;
-  onlyACount: number;
-  onlyBCount: number;
-  rows: AlignedRow[];
-  isTruncated: boolean;
-}
+const SAMPLE_PROD = `Counter|Scenario Name|Release Type(B: BE; R: Brand; P: Primary Offering; O: Supplementary Offering)|Release Object
+PO_Speed_2|SCE_PO_POS_10M|P|C_PO_52100117
+SO_Speed_30M|SCE_SO_PPS_30M_63210012|O|C_SO_63210012
+SFU_Speed_Max_LEGACY|SCE_SFU_4GMax|P|C_PO_51006670
+PO_Speed_2|SCE_PO_POS_20M|O|C_PO_52100118
+O_Dr_AWN_20M_128k|SCE_SO_PPS_20M_63210084_2|O|C_SO_63210084
+PO_Legacy_Voice|SCE_PO_VOICE_199|P|C_PO_51001199`;
 
-interface FileState {
-  file: File | null;
-  name: string;
-  content: any[][];
-  headers: string[];
-  sheetNames: string[];
-  selectedSheet: string;
-  rawWorkbook: XLSX.WorkBook | null;
-  isExcel: boolean;
-  inputMode: 'file' | 'paste';
-  pastedText: string;
-}
+// Inline character/token diff highlighter
+function FieldValueDiff({
+  valTb,
+  valProd,
+  isDiff,
+  side,
+}: {
+  valTb?: string;
+  valProd?: string;
+  isDiff: boolean;
+  side: 'TB' | 'PROD';
+}) {
+  const myVal = side === 'TB' ? valTb : valProd;
+  const otherVal = side === 'TB' ? valProd : valTb;
 
-const INITIAL_FILE_STATE: FileState = {
-  file: null,
-  name: '',
-  content: [],
-  headers: [],
-  sheetNames: [],
-  selectedSheet: '',
-  rawWorkbook: null,
-  isExcel: false,
-  inputMode: 'file',
-  pastedText: ''
-};
-
-const MAX_DISPLAY_ROWS = 2500;
-
-// Helper: Highlight character/word differences between two strings
-function renderInlineDiff(textA: string, textB: string, side: 'A' | 'B') {
-  if (!textA && !textB) return <span className="text-white/20 italic">empty</span>;
-  if (side === 'A' && !textA) return <span className="text-white/20 italic">— ไม่มีข้อมูล —</span>;
-  if (side === 'B' && !textB) return <span className="text-white/20 italic">— ไม่มีข้อมูล —</span>;
-  if (textA === textB) {
-    return <span>{side === 'A' ? textA : textB}</span>;
+  if (!myVal) {
+    return <span className="text-slate-600 italic">—</span>;
   }
 
-  // Split by pipe or space or token to highlight exact segments that differ
-  const sep = textA.includes(' | ') || textB.includes(' | ') ? ' | ' : null;
-  if (sep) {
-    const partsA = textA.split(' | ');
-    const partsB = textB.split(' | ');
-    const myParts = side === 'A' ? partsA : partsB;
-    const otherParts = side === 'A' ? partsB : partsA;
-
-    return (
-      <span className="inline-flex flex-wrap items-center gap-1">
-        {myParts.map((part, idx) => {
-          const isSame = part.trim() === (otherParts[idx] ?? '').trim();
-          return (
-            <React.Fragment key={idx}>
-              {idx > 0 && <span className="text-white/20">|</span>}
-              <span
-                className={
-                  isSame
-                    ? 'text-white/60'
-                    : side === 'A'
-                    ? 'rounded bg-amber-500/25 px-1 py-0.5 font-bold text-amber-200 border border-amber-400/30'
-                    : 'rounded bg-sky-500/25 px-1 py-0.5 font-bold text-sky-200 border border-sky-400/30'
-                }
-              >
-                {part || 'empty'}
-              </span>
-            </React.Fragment>
-          );
-        })}
-      </span>
-    );
+  if (!isDiff || !otherVal) {
+    return <span className="text-slate-200">{myVal}</span>;
   }
 
-  // Character-level prefix/suffix diff for single strings
-  let prefixLen = 0;
-  const minLen = Math.min(textA.length, textB.length);
-  while (prefixLen < minLen && textA[prefixLen] === textB[prefixLen]) {
-    prefixLen++;
+  // Highlight character-level difference
+  let prefix = 0;
+  const minLen = Math.min(myVal.length, otherVal.length);
+  while (prefix < minLen && myVal[prefix] === otherVal[prefix]) {
+    prefix++;
   }
 
-  let suffixLen = 0;
+  let suffix = 0;
   while (
-    suffixLen < minLen - prefixLen &&
-    textA[textA.length - 1 - suffixLen] === textB[textB.length - 1 - suffixLen]
+    suffix < minLen - prefix &&
+    myVal[myVal.length - 1 - suffix] === otherVal[otherVal.length - 1 - suffix]
   ) {
-    suffixLen++;
+    suffix++;
   }
 
-  const target = side === 'A' ? textA : textB;
-  const prefix = target.slice(0, prefixLen);
-  const mid = target.slice(prefixLen, target.length - suffixLen);
-  const suffix = suffixLen > 0 ? target.slice(target.length - suffixLen) : '';
+  const start = myVal.slice(0, prefix);
+  const mid = myVal.slice(prefix, myVal.length - suffix);
+  const end = suffix > 0 ? myVal.slice(myVal.length - suffix) : '';
 
   return (
-    <span>
-      <span className="text-white/60">{prefix}</span>
+    <span className="font-semibold">
+      <span className="text-slate-300">{start}</span>
       {mid ? (
-        <span
-          className={
-            side === 'A'
-              ? 'rounded bg-amber-500/30 px-1 font-bold text-amber-200 underline decoration-amber-400/60'
-              : 'rounded bg-sky-500/30 px-1 font-bold text-sky-200 underline decoration-sky-400/60'
-          }
+        <mark
+          className={`rounded px-1 py-0.5 font-bold ${
+            side === 'TB'
+              ? 'bg-amber-500/35 text-amber-200 border border-amber-400/50'
+              : 'bg-sky-500/35 text-sky-200 border border-sky-400/50'
+          }`}
         >
           {mid}
-        </span>
+        </mark>
       ) : (
-        <span className="mx-0.5 inline-block h-3 w-1 rounded bg-rose-400/60 align-middle" title="จุดที่มีข้อมูลขาดหาย" />
+        <span className="mx-0.5 inline-block h-3.5 w-1.5 rounded bg-rose-500 align-middle" />
       )}
-      <span className="text-white/60">{suffix}</span>
+      <span className="text-slate-300">{end}</span>
     </span>
   );
 }
 
-export default function ComparatorPage() {
-  const [fileA, setFileA] = useState<FileState>(INITIAL_FILE_STATE);
-  const [fileB, setFileB] = useState<FileState>(INITIAL_FILE_STATE);
+export default function ScenarioReleaseComparatorPage() {
+  // Raw text state for Testbase (TB) and Production (Prod)
+  const [tbText, setTbText] = useState<string>('');
+  const [prodText, setProdText] = useState<string>('');
+  const [tbFileName, setTbFileName] = useState<string>('');
+  const [prodFileName, setProdFileName] = useState<string>('');
+  const [tbMode, setTbMode] = useState<'paste' | 'file'>('paste');
+  const [prodMode, setProdMode] = useState<'paste' | 'file'>('paste');
+  const [dragSide, setDragSide] = useState<'TB' | 'PROD' | null>(null);
 
-  // Column selections
-  const [selectedColA, setSelectedColA] = useState('');
-  const [selectedColB, setSelectedColB] = useState('');
-  const [keyColA, setKeyColA] = useState('');
-  const [keyColB, setKeyColB] = useState('');
-
-  // Compare Mode & Settings
-  const [compareMode, setCompareMode] = useState<CompareMode>('smart_align');
-  const [settings, setSettings] = useState({
+  // Engine Options
+  const [options, setOptions] = useState<DiffEngineOptions>({
     caseSensitive: false,
     trimWhitespace: true,
-    ignoreEmptyLines: true,
-    skipHeaderRow: true,
-    sortBeforeCompare: true,
+    ignoreHeader: true,
+    deduplicateExactLines: false,
+    keyStrategy: 'SCENARIO_AND_OBJECT',
   });
 
-  // Results & Filtering
-  const [result, setResult] = useState<CompareSummary | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [status, setStatus] = useState('รออัปโหลดหรือวางข้อมูล 2 ฝั่ง');
-  const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'diff_only' | DiffStatus>('diff_only');
-  const [copiedState, setCopiedState] = useState<string | null>(null);
-  const [dragOverSide, setDragOverSide] = useState<'A' | 'B' | null>(null);
+  // UI Filters
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'DIFF_ONLY' | ScenarioDiffStatus>('DIFF_ONLY');
+  const [releaseTypeFilter, setReleaseTypeFilter] = useState<string>('ALL');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [visibleLimit, setVisibleLimit] = useState<number>(PAGE_SIZE);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  const isReady = useMemo(() => {
-    return fileA.content.length > 0 && fileB.content.length > 0;
-  }, [fileA.content.length, fileB.content.length]);
-
-  // Animated dot grid
+  // Reset pagination when filters change
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-    };
-    resize();
-    window.addEventListener('resize', resize);
-    let frame = 0;
-    let animId: number;
-    const draw = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const spacing = 40;
-      const cols = Math.ceil(canvas.width / spacing);
-      const rows = Math.ceil(canvas.height / spacing);
-      for (let x = 0; x <= cols; x++) {
-        for (let y = 0; y <= rows; y++) {
-          const pulse = Math.sin(frame * 0.008 + x * 0.3 + y * 0.2) * 0.5 + 0.5;
-          ctx.beginPath();
-          ctx.arc(x * spacing, y * spacing, 0.8, 0, Math.PI * 2);
-          ctx.fillStyle = `rgba(52,211,153,${0.04 + pulse * 0.06})`;
-          ctx.fill();
-        }
+    setVisibleLimit(PAGE_SIZE);
+  }, [statusFilter, releaseTypeFilter, searchQuery, options]);
+
+  // Run Pure Diff Engine via useMemo (Instant O(N) calculation)
+  const summary = useMemo(() => {
+    if (!tbText.trim() && !prodText.trim()) return null;
+    return compareScenarioReleases(tbText, prodText, options);
+  }, [tbText, prodText, options]);
+
+  // If 100% matched, auto-switch filter from DIFF_ONLY to ALL so user sees their matched rows
+  useEffect(() => {
+    if (!summary) return;
+    const totalDiffs =
+      summary.modifiedCount + summary.onlyTbCount + summary.onlyProdCount + summary.malformedCount;
+    if (totalDiffs === 0 && summary.matchCount > 0 && statusFilter === 'DIFF_ONLY') {
+      setStatusFilter('ALL');
+    }
+  }, [summary]);
+
+  // Filtered rows
+  const filteredRows = useMemo(() => {
+    if (!summary) return [];
+    const q = searchQuery.trim().toLowerCase();
+
+    return summary.rows.filter(row => {
+      // 1. Status filter
+      if (statusFilter === 'DIFF_ONLY' && row.status === 'MATCH') return false;
+      if (statusFilter !== 'ALL' && statusFilter !== 'DIFF_ONLY' && row.status !== statusFilter) {
+        return false;
       }
-      frame++;
-      animId = requestAnimationFrame(draw);
-    };
-    draw();
-    return () => {
-      window.removeEventListener('resize', resize);
-      cancelAnimationFrame(animId);
-    };
-  }, []);
 
-  // Normalize string for comparison
-  const normalizeStr = (val: string) => {
-    let s = String(val ?? '');
-    if (settings.trimWhitespace) {
-      s = s.replace(/\s+/g, ' ').trim();
-    }
-    if (!settings.caseSensitive) {
-      s = s.toLowerCase();
-    }
-    return s;
-  };
+      // 2. Release Type filter (B / R / P / O)
+      if (releaseTypeFilter !== 'ALL') {
+        const rtTb = row.tbRecord?.releaseType?.toUpperCase() || '';
+        const rtProd = row.prodRecord?.releaseType?.toUpperCase() || '';
+        if (rtTb !== releaseTypeFilter && rtProd !== releaseTypeFilter) return false;
+      }
 
-  // Format row to display string
-  const formatRowText = (row: any[], colIdx: number) => {
-    if (!row) return '';
-    if (colIdx !== -1) {
-      return String(row[colIdx] ?? '');
-    }
-    return row
-      .map(cell => String(cell ?? '').trim())
-      .filter((c, i, arr) => !(c === '' && i === arr.length - 1))
-      .join(' | ');
-  };
+      // 3. Search query across all 4 columns
+      if (q !== '') {
+        const hayTb = row.tbRecord?.rawLine.toLowerCase() || '';
+        const hayProd = row.prodRecord?.rawLine.toLowerCase() || '';
+        return hayTb.includes(q) || hayProd.includes(q);
+      }
 
-  // Parse pasted text into 2D array
-  const handlePasteChange = (text: string, side: 'A' | 'B') => {
-    const rawLines = text.split(/\r?\n/);
-    const isTabSeparated = rawLines.some(l => l.includes('\t'));
-    const content = rawLines.map(line => (isTabSeparated ? line.split('\t') : [line]));
-    const headers = isTabSeparated && content.length > 0 ? content[0].map((h, i) => String(h || `Col_${i + 1}`)) : [];
+      return true;
+    });
+  }, [summary, statusFilter, releaseTypeFilter, searchQuery]);
 
-    const updateFn = side === 'A' ? setFileA : setFileB;
-    updateFn(prev => ({
-      ...prev,
-      name: `Pasted Text (${content.filter(r => r.join('').trim() !== '').length} บรรทัด)`,
-      pastedText: text,
-      content,
-      headers,
-      isExcel: isTabSeparated && headers.length > 1
-    }));
-    setResult(null);
-    setStatus('โหลดข้อความเรียบร้อย — พร้อมเปรียบเทียบ');
-  };
+  const displayedRows = useMemo(() => {
+    return filteredRows.slice(0, visibleLimit);
+  }, [filteredRows, visibleLimit]);
 
-  // Load file (Excel / CSV / TXT)
-  const processUploadedFile = (file: File, side: 'A' | 'B') => {
-    const isExcel = /\.(xlsx|xls|csv)$/i.test(file.name);
+  // Load File (TXT / CSV / Excel)
+  const handleFileUpload = (file: File, side: 'TB' | 'PROD') => {
+    const isExcel = /\.(xlsx|xls)$/i.test(file.name);
     const reader = new FileReader();
-    setStatus(`กำลังอ่านไฟล์ ${file.name}...`);
 
     reader.onload = ev => {
-      let content: any[][] = [];
-      let headers: string[] = [];
-      let sheetNames: string[] = [];
-      let selectedSheet = '';
-      let rawWorkbook: XLSX.WorkBook | null = null;
-
+      let textContent = '';
       if (isExcel) {
         const data = new Uint8Array(ev.target?.result as ArrayBuffer);
-        rawWorkbook = XLSX.read(data, { type: 'array' });
-        sheetNames = rawWorkbook.SheetNames;
-        selectedSheet = sheetNames[0] || '';
-        const ws = rawWorkbook.Sheets[selectedSheet];
-        content = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as any[][];
-        headers = (content[0] || []).map((h, idx) => String(h || `Column ${idx + 1}`));
+        const wb = XLSX.read(data, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as any[][];
+        textContent = rows
+          .map(r => (r.length === 1 ? String(r[0]) : r.slice(0, 4).join('|')))
+          .join('\n');
       } else {
-        const text = ev.target?.result as string;
-        content = text.split(/\r?\n/).map(line => [line]);
+        textContent = (ev.target?.result as string) || '';
       }
 
-      const newState: FileState = {
-        file,
-        name: file.name,
-        content,
-        headers,
-        sheetNames,
-        selectedSheet,
-        rawWorkbook,
-        isExcel,
-        inputMode: 'file',
-        pastedText: ''
-      };
-
-      if (side === 'A') {
-        setFileA(newState);
-        setSelectedColA('');
-        setKeyColA('');
+      if (side === 'TB') {
+        setTbText(textContent);
+        setTbFileName(file.name);
       } else {
-        setFileB(newState);
-        setSelectedColB('');
-        setKeyColB('');
+        setProdText(textContent);
+        setProdFileName(file.name);
       }
-      setResult(null);
-      setStatus(`โหลดไฟล์ ${file.name} สำเร็จ (${content.length.toLocaleString()} แถว)`);
     };
 
     if (isExcel) reader.readAsArrayBuffer(file);
-    else reader.readAsText(file);
+    else reader.readAsText(file, 'utf-8');
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, side: 'A' | 'B') => {
-    const file = e.target.files?.[0];
-    if (file) processUploadedFile(file, side);
+  const handleSwap = () => {
+    setTbText(prodText);
+    setProdText(tbText);
+    setTbFileName(prodFileName);
+    setProdFileName(tbFileName);
   };
 
-  const handleSheetChange = (sheetName: string, side: 'A' | 'B') => {
-    const target = side === 'A' ? fileA : fileB;
-    if (!target.rawWorkbook) return;
-    const ws = target.rawWorkbook.Sheets[sheetName];
-    const content = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as any[][];
-    const headers = (content[0] || []).map((h, idx) => String(h || `Column ${idx + 1}`));
-
-    if (side === 'A') {
-      setFileA(prev => ({ ...prev, selectedSheet: sheetName, content, headers }));
-      setSelectedColA('');
-      setKeyColA('');
-    } else {
-      setFileB(prev => ({ ...prev, selectedSheet: sheetName, content, headers }));
-      setSelectedColB('');
-      setKeyColB('');
-    }
-    setResult(null);
+  const handleLoadSample = () => {
+    setTbText(SAMPLE_TB);
+    setProdText(SAMPLE_PROD);
+    setTbFileName('TB_Scenario_Release.txt');
+    setProdFileName('PRD_Scenario_Release.txt');
+    setTbMode('paste');
+    setProdMode('paste');
+    setStatusFilter('DIFF_ONLY');
   };
 
-  const handleSwapFiles = () => {
-    const tempFile = fileA;
-    const tempCol = selectedColA;
-    const tempKey = keyColA;
-    setFileA(fileB);
-    setSelectedColA(selectedColB);
-    setKeyColA(keyColB);
-    setFileB(tempFile);
-    setSelectedColB(tempCol);
-    setKeyColB(tempKey);
-    setResult(null);
-    setStatus('สลับฝั่งไฟล์ A ⇄ B เรียบร้อย');
-  };
+  // Export Styled Multi-Sheet Excel Report using ExcelJS
+  const handleExportExcel = async () => {
+    if (!summary) return;
+    const ExcelJS = (await import('exceljs')).default;
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'BILLONE Scenario Release Comparator';
+    workbook.created = new Date();
 
-  // --- CORE COMPARISON & AUTO-ALIGNMENT ENGINE ---
-  const handleCompare = () => {
-    if (!isReady) return;
-    setIsProcessing(true);
-    setStatus('กำลังจัดเรียงบรรทัดและเปรียบเทียบข้อมูล...');
-
-    setTimeout(() => {
-      const idxA = fileA.isExcel && selectedColA ? fileA.headers.indexOf(selectedColA) : -1;
-      const idxB = fileB.isExcel && selectedColB ? fileB.headers.indexOf(selectedColB) : -1;
-
-      const keyIdxA = fileA.isExcel && keyColA ? fileA.headers.indexOf(keyColA) : 0;
-      const keyIdxB = fileB.isExcel && keyColB ? fileB.headers.indexOf(keyColB) : 0;
-
-      const startRowA = fileA.isExcel && settings.skipHeaderRow ? 1 : 0;
-      const startRowB = fileB.isExcel && settings.skipHeaderRow ? 1 : 0;
-
-      // Build structured items from A and B
-      type Item = {
-        origLine: number;
-        text: string;
-        normText: string;
-        keyText: string;
-        normKey: string;
-        raw: any[];
-      };
-
-      const buildList = (data: any[][], startIdx: number, colIdx: number, kIdx: number): Item[] => {
-        const list: Item[] = [];
-        for (let i = startIdx; i < data.length; i++) {
-          const row = data[i];
-          const text = formatRowText(row, colIdx);
-          const normText = normalizeStr(text);
-          if (settings.ignoreEmptyLines && normText === '') continue;
-
-          const keyRaw = kIdx !== -1 && row[kIdx] !== undefined ? String(row[kIdx]) : text.split('|')[0] || text;
-          const normKey = normalizeStr(keyRaw);
-
-          list.push({
-            origLine: i + 1,
-            text: settings.trimWhitespace ? text.trim() : text,
-            normText,
-            keyText: keyRaw.trim(),
-            normKey,
-            raw: row
-          });
-        }
-        return list;
-      };
-
-      const listA = buildList(fileA.content, startRowA, idxA, keyIdxA);
-      const listB = buildList(fileB.content, startRowB, idxB, keyIdxB);
-
-      const alignedRows: AlignedRow[] = [];
-      let matchCount = 0;
-      let modifiedCount = 0;
-      let onlyACount = 0;
-      let onlyBCount = 0;
-
-      if (compareMode === 'smart_align') {
-        // Mode 1: Smart Align & Sort
-        // Group items by normalized full text first, then pair up identical items,
-        // and for remaining unmatched items, try pairing by primary key/first token or sort them side-by-side!
-        const mapA = new Map<string, Item[]>();
-        const mapB = new Map<string, Item[]>();
-
-        listA.forEach(item => {
-          const arr = mapA.get(item.normText) || [];
-          arr.push(item);
-          mapA.set(item.normText, arr);
-        });
-        listB.forEach(item => {
-          const arr = mapB.get(item.normText) || [];
-          arr.push(item);
-          mapB.set(item.normText, arr);
-        });
-
-        const matchedRows: AlignedRow[] = [];
-        const leftoverA: Item[] = [];
-        const leftoverB: Item[] = [];
-
-        // 1. Exact matches across entire files (regardless of original line order)
-        const allNormTexts = new Set([...mapA.keys(), ...mapB.keys()]);
-        allNormTexts.forEach(normKey => {
-          const aItems = mapA.get(normKey) || [];
-          const bItems = mapB.get(normKey) || [];
-          const commonLen = Math.min(aItems.length, bItems.length);
-
-          for (let i = 0; i < commonLen; i++) {
-            matchCount++;
-            matchedRows.push({
-              index: 0,
-              lineNumA: aItems[i].origLine,
-              lineNumB: bItems[i].origLine,
-              keyVal: aItems[i].keyText,
-              contentA: aItems[i].text,
-              contentB: bItems[i].text,
-              rawRowA: aItems[i].raw,
-              rawRowB: bItems[i].raw,
-              status: 'match'
-            });
-          }
-          for (let i = commonLen; i < aItems.length; i++) leftoverA.push(aItems[i]);
-          for (let i = commonLen; i < bItems.length; i++) leftoverB.push(bItems[i]);
-        });
-
-        // 2. Try matching leftovers by Key (first column or selected key column) so modified lines align on the same row!
-        const keyMapB = new Map<string, Item[]>();
-        leftoverB.forEach(item => {
-          if (item.normKey) {
-            const arr = keyMapB.get(item.normKey) || [];
-            arr.push(item);
-            keyMapB.set(item.normKey, arr);
-          }
-        });
-
-        const unmatchedA: Item[] = [];
-        const pairedRows: AlignedRow[] = [];
-
-        leftoverA.forEach(itemA => {
-          const bCandidates = itemA.normKey ? keyMapB.get(itemA.normKey) : undefined;
-          if (bCandidates && bCandidates.length > 0) {
-            const itemB = bCandidates.shift()!;
-            modifiedCount++;
-            pairedRows.push({
-              index: 0,
-              lineNumA: itemA.origLine,
-              lineNumB: itemB.origLine,
-              keyVal: itemA.keyText,
-              contentA: itemA.text,
-              contentB: itemB.text,
-              rawRowA: itemA.raw,
-              rawRowB: itemB.raw,
-              status: 'modified'
-            });
-          } else {
-            unmatchedA.push(itemA);
-          }
-        });
-
-        const unmatchedB: Item[] = [];
-        keyMapB.forEach(arr => unmatchedB.push(...arr));
-        leftoverB.filter(x => !x.normKey).forEach(x => unmatchedB.push(x));
-
-        // Sort unmatched items so similar strings appear next to each other
-        if (settings.sortBeforeCompare) {
-          unmatchedA.sort((a, b) => a.normText.localeCompare(b.normText, 'th'));
-          unmatchedB.sort((a, b) => a.normText.localeCompare(b.normText, 'th'));
-        }
-
-        unmatchedA.forEach(itemA => {
-          onlyACount++;
-          pairedRows.push({
-            index: 0,
-            lineNumA: itemA.origLine,
-            lineNumB: null,
-            keyVal: itemA.keyText,
-            contentA: itemA.text,
-            contentB: '',
-            rawRowA: itemA.raw,
-            status: 'only_a'
-          });
-        });
-
-        unmatchedB.forEach(itemB => {
-          onlyBCount++;
-          pairedRows.push({
-            index: 0,
-            lineNumA: null,
-            lineNumB: itemB.origLine,
-            keyVal: itemB.keyText,
-            contentA: '',
-            contentB: itemB.text,
-            rawRowB: itemB.raw,
-            status: 'only_b'
-          });
-        });
-
-        // Combine and sort so everything is aligned cleanly
-        const combined = [...pairedRows, ...matchedRows];
-        if (settings.sortBeforeCompare) {
-          combined.sort((a, b) => {
-            // Put differences first or sort alphabetically by content/key
-            const strA = normalizeStr(a.contentA || a.contentB);
-            const strB = normalizeStr(b.contentA || b.contentB);
-            return strA.localeCompare(strB, 'th', { numeric: true });
-          });
-        }
-
-        combined.forEach((r, idx) => {
-          r.index = idx + 1;
-          alignedRows.push(r);
-        });
-      } else if (compareMode === 'key_match') {
-        // Mode 2: Key Column Alignment (like VLOOKUP / SQL FULL OUTER JOIN)
-        const mapA = new Map<string, Item[]>();
-        const mapB = new Map<string, Item[]>();
-        const allKeysOrder: string[] = [];
-        const seenKeys = new Set<string>();
-
-        listA.forEach(item => {
-          const k = item.normKey || `__EMPTY_${item.origLine}`;
-          if (!seenKeys.has(k)) {
-            seenKeys.add(k);
-            allKeysOrder.push(k);
-          }
-          const arr = mapA.get(k) || [];
-          arr.push(item);
-          mapA.set(k, arr);
-        });
-
-        listB.forEach(item => {
-          const k = item.normKey || `__EMPTY_B_${item.origLine}`;
-          if (!seenKeys.has(k)) {
-            seenKeys.add(k);
-            allKeysOrder.push(k);
-          }
-          const arr = mapB.get(k) || [];
-          arr.push(item);
-          mapB.set(k, arr);
-        });
-
-        if (settings.sortBeforeCompare) {
-          allKeysOrder.sort((a, b) => a.localeCompare(b, 'th', { numeric: true }));
-        }
-
-        let idxCounter = 1;
-        allKeysOrder.forEach(k => {
-          const aItems = mapA.get(k) || [];
-          const bItems = mapB.get(k) || [];
-          const maxLen = Math.max(aItems.length, bItems.length);
-
-          for (let i = 0; i < maxLen; i++) {
-            const itemA = aItems[i];
-            const itemB = bItems[i];
-
-            if (itemA && itemB) {
-              const isSame = itemA.normText === itemB.normText;
-              if (isSame) matchCount++;
-              else modifiedCount++;
-
-              alignedRows.push({
-                index: idxCounter++,
-                lineNumA: itemA.origLine,
-                lineNumB: itemB.origLine,
-                keyVal: itemA.keyText || itemB.keyText,
-                contentA: itemA.text,
-                contentB: itemB.text,
-                rawRowA: itemA.raw,
-                rawRowB: itemB.raw,
-                status: isSame ? 'match' : 'modified'
-              });
-            } else if (itemA) {
-              onlyACount++;
-              alignedRows.push({
-                index: idxCounter++,
-                lineNumA: itemA.origLine,
-                lineNumB: null,
-                keyVal: itemA.keyText,
-                contentA: itemA.text,
-                contentB: '',
-                rawRowA: itemA.raw,
-                status: 'only_a'
-              });
-            } else if (itemB) {
-              onlyBCount++;
-              alignedRows.push({
-                index: idxCounter++,
-                lineNumA: null,
-                lineNumB: itemB.origLine,
-                keyVal: itemB.keyText,
-                contentA: '',
-                contentB: itemB.text,
-                rawRowB: itemB.raw,
-                status: 'only_b'
-              });
-            }
-          }
-        });
-      } else {
-        // Mode 3: Strict Line-by-Line (with optional A-Z sort first)
-        const sortedA = settings.sortBeforeCompare
-          ? [...listA].sort((a, b) => a.normText.localeCompare(b.normText, 'th', { numeric: true }))
-          : listA;
-        const sortedB = settings.sortBeforeCompare
-          ? [...listB].sort((a, b) => a.normText.localeCompare(b.normText, 'th', { numeric: true }))
-          : listB;
-
-        const maxLen = Math.max(sortedA.length, sortedB.length);
-        for (let i = 0; i < maxLen; i++) {
-          const itemA = sortedA[i];
-          const itemB = sortedB[i];
-
-          if (itemA && itemB) {
-            const isSame = itemA.normText === itemB.normText;
-            if (isSame) matchCount++;
-            else modifiedCount++;
-
-            alignedRows.push({
-              index: i + 1,
-              lineNumA: itemA.origLine,
-              lineNumB: itemB.origLine,
-              keyVal: `#${i + 1}`,
-              contentA: itemA.text,
-              contentB: itemB.text,
-              rawRowA: itemA.raw,
-              rawRowB: itemB.raw,
-              status: isSame ? 'match' : 'modified'
-            });
-          } else if (itemA) {
-            onlyACount++;
-            alignedRows.push({
-              index: i + 1,
-              lineNumA: itemA.origLine,
-              lineNumB: null,
-              keyVal: `#${i + 1}`,
-              contentA: itemA.text,
-              contentB: '',
-              rawRowA: itemA.raw,
-              status: 'only_a'
-            });
-          } else if (itemB) {
-            onlyBCount++;
-            alignedRows.push({
-              index: i + 1,
-              lineNumA: null,
-              lineNumB: itemB.origLine,
-              keyVal: `#${i + 1}`,
-              contentA: '',
-              contentB: itemB.text,
-              rawRowB: itemB.raw,
-              status: 'only_b'
-            });
-          }
-        }
-      }
-
-      const totalDiffs = modifiedCount + onlyACount + onlyBCount;
-      setResult({
-        totalAligned: alignedRows.length,
-        matchCount,
-        modifiedCount,
-        onlyACount,
-        onlyBCount,
-        rows: alignedRows,
-        isTruncated: alignedRows.length > MAX_DISPLAY_ROWS
-      });
-
-      if (totalDiffs === 0) {
-        setStatusFilter('all');
-        setStatus('✓ ข้อมูลตรงกันสมบูรณ์ 100%');
-      } else {
-        setStatusFilter('diff_only');
-        setStatus(`พบจุดต่าง ${totalDiffs.toLocaleString()} รายการ (จัดเรียงเทียบให้แล้ว)`);
-      }
-      setIsProcessing(false);
-    }, 80);
-  };
-
-  // Filtered rows for display
-  const filteredRows = useMemo(() => {
-    if (!result) return [];
-    return result.rows.filter(r => {
-      if (statusFilter === 'diff_only' && r.status === 'match') return false;
-      if (statusFilter !== 'all' && statusFilter !== 'diff_only' && r.status !== statusFilter) return false;
-      if (searchTerm.trim() !== '') {
-        const q = searchTerm.toLowerCase();
-        return (
-          r.contentA.toLowerCase().includes(q) ||
-          r.contentB.toLowerCase().includes(q) ||
-          r.keyVal.toLowerCase().includes(q)
-        );
-      }
-      return true;
-    });
-  }, [result, statusFilter, searchTerm]);
-
-  const displayedRows = useMemo(() => {
-    return filteredRows.slice(0, MAX_DISPLAY_ROWS);
-  }, [filteredRows]);
-
-  const matchPct = useMemo(() => {
-    if (!result || result.totalAligned === 0) return '0.0';
-    return ((result.matchCount / result.totalAligned) * 100).toFixed(1);
-  }, [result]);
-
-  // Export Multi-Sheet Excel Report
-  const exportReport = () => {
-    if (!result) return;
-    const wb = XLSX.utils.book_new();
-
-    const statusLabel = (s: DiffStatus) => {
-      if (s === 'match') return 'ตรงกัน (Match)';
-      if (s === 'modified') return 'ข้อมูลไม่ตรง (Modified)';
-      if (s === 'only_a') return 'มีเฉพาะฝั่ง A (Missing in B)';
-      return 'มีเฉพาะฝั่ง B (Missing in A)';
+    const statusLabelMap: Record<ScenarioDiffStatus, string> = {
+      MATCH: 'ตรงกัน (Match)',
+      MODIFIED: 'ค่าไม่ตรงกัน (Modified)',
+      ONLY_TB: 'มีเฉพาะ TB (Missing in PRD)',
+      ONLY_PROD: 'มีเฉพาะ PRD (Extra in PRD)',
+      MALFORMED: 'รูปแบบผิด (Malformed)',
     };
 
-    // 1. All Aligned Rows
-    const allSheetData = result.rows.map(r => ({
-      'ลำดับที่จัดเรียง': r.index,
-      'สถานะ': statusLabel(r.status),
-      'Key / รหัสอ้างอิง': r.keyVal,
-      'บรรทัดเดิม (A)': r.lineNumA ?? '-',
-      'ข้อมูลฝั่ง A': r.contentA || '-',
-      'บรรทัดเดิม (B)': r.lineNumB ?? '-',
-      'ข้อมูลฝั่ง B': r.contentB || '-'
-    }));
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(allSheetData), 'All_Aligned');
+    const buildSheet = (sheetName: string, rows: AlignedScenarioRow[]) => {
+      const sheet = workbook.addWorksheet(sheetName, {
+        views: [{ state: 'frozen', ySplit: 1 }],
+      });
 
-    // 2. Differences Only
-    const diffSheetData = result.rows
-      .filter(r => r.status !== 'match')
-      .map(r => ({
-        'ลำดับ': r.index,
-        'สถานะ': statusLabel(r.status),
-        'Key / รหัสอ้างอิง': r.keyVal,
-        'บรรทัดเดิม (A)': r.lineNumA ?? '-',
-        'ข้อมูลฝั่ง A': r.contentA || '-',
-        'บรรทัดเดิม (B)': r.lineNumB ?? '-',
-        'ข้อมูลฝั่ง B': r.contentB || '-'
-      }));
-    if (diffSheetData.length > 0) {
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(diffSheetData), 'Differences_Only');
+      // No sequence number column ('ลำดับ') so it doesn't duplicate Excel's native row numbers!
+      sheet.columns = [
+        { header: 'สถานะ (Status)', key: 'status', width: 26 },
+        { header: 'คอลัมน์ที่ต่าง (Diff Fields)', key: 'diffFields', width: 26 },
+        { header: 'TB: Counter', key: 'tbCounter', width: 26 },
+        { header: 'PRD: Counter', key: 'prodCounter', width: 26 },
+        { header: 'TB: Scenario Name', key: 'tbScenario', width: 34 },
+        { header: 'PRD: Scenario Name', key: 'prodScenario', width: 34 },
+        { header: 'TB: Type', key: 'tbType', width: 12 },
+        { header: 'PRD: Type', key: 'prodType', width: 12 },
+        { header: 'TB: Release Object', key: 'tbObject', width: 22 },
+        { header: 'PRD: Release Object', key: 'prodObject', width: 22 },
+        { header: 'บรรทัดเดิม (TB / PRD)', key: 'origLines', width: 20 },
+      ];
+
+      // Style Header Row (Formal, muted corporate tone — color only on header)
+      const headerRow = sheet.getRow(1);
+      headerRow.height = 26;
+      headerRow.eachCell((cell, colNumber) => {
+        cell.font = {
+          name: 'Segoe UI',
+          size: 10,
+          bold: true,
+          color: { argb: 'FFFFFFFF' },
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF334155' }, // Formal Slate-700
+        };
+        cell.alignment = {
+          vertical: 'middle',
+          horizontal: colNumber >= 7 && colNumber <= 8 ? 'center' : 'left',
+          wrapText: true,
+        };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+          left: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+          bottom: { style: 'medium', color: { argb: 'FF1E293B' } },
+          right: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+        };
+      });
+
+      // Enable AutoFilter on all columns
+      sheet.autoFilter = {
+        from: { row: 1, column: 1 },
+        to: { row: 1, column: 11 },
+      };
+
+      // Populate Data Rows (Clean corporate look + subtle pastel tint ONLY on cells that differ)
+      rows.forEach((r, rowIdx) => {
+        const changedCols: string[] = [];
+        if (r.status === 'MODIFIED') {
+          if (r.diffFields.counter) changedCols.push('Counter');
+          if (r.diffFields.scenarioName) changedCols.push('Scenario Name');
+          if (r.diffFields.releaseType) changedCols.push('Release Type');
+          if (r.diffFields.releaseObject) changedCols.push('Release Object');
+        }
+
+        const rowValues = {
+          status: statusLabelMap[r.status],
+          diffFields: changedCols.join(', ') || '-',
+          tbCounter: r.tbRecord?.counter ?? '-',
+          prodCounter: r.prodRecord?.counter ?? '-',
+          tbScenario: r.tbRecord?.scenarioName ?? '-',
+          prodScenario: r.prodRecord?.scenarioName ?? '-',
+          tbType: r.tbRecord?.releaseType ?? '-',
+          prodType: r.prodRecord?.releaseType ?? '-',
+          tbObject: r.tbRecord?.releaseObject ?? '-',
+          prodObject: r.prodRecord?.releaseObject ?? '-',
+          origLines: `L${r.tbRecord?.lineNumber ?? '-'} / L${r.prodRecord?.lineNumber ?? '-'}`,
+        };
+
+        const excelRow = sheet.addRow(rowValues);
+        excelRow.height = 21;
+
+        // Subtle zebra stripe for readability (White / Very faint gray #F8FAFC)
+        const baseBg = rowIdx % 2 === 1 ? 'FFF8FAFC' : 'FFFFFFFF';
+
+        excelRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+          cell.font = {
+            name: colNumber <= 2 ? 'Segoe UI' : 'Consolas',
+            size: 10,
+            color: { argb: 'FF1E293B' },
+          };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: baseBg },
+          };
+          cell.alignment = {
+            vertical: 'middle',
+            horizontal: colNumber === 7 || colNumber === 8 || colNumber === 11 ? 'center' : 'left',
+          };
+          cell.border = {
+            top: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+            left: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+            bottom: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+            right: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+          };
+        });
+
+        // Subtle muted text color on Status column (Col 1) without heavy background fill
+        const statusCell = excelRow.getCell(1);
+        const statusTextColor: Record<ScenarioDiffStatus, string> = {
+          MATCH: 'FF15803D',    // Muted Green
+          MODIFIED: 'FFB45309', // Muted Amber/Brown
+          ONLY_TB: 'FFC2410C',  // Muted Orange
+          ONLY_PROD: 'FF0369A1', // Muted Blue
+          MALFORMED: 'FFB91C1C', // Muted Red
+        };
+        statusCell.font = {
+          name: 'Segoe UI',
+          size: 10,
+          bold: r.status !== 'MATCH',
+          color: { argb: statusTextColor[r.status] },
+        };
+
+        // Soft pastel cream highlight (#FEF9C3) ONLY on the exact cells that don't match
+        if (r.status === 'MODIFIED') {
+          const highlightDiffPair = (tbCol: number, prdCol: number) => {
+            [tbCol, prdCol].forEach(cIdx => {
+              const c = excelRow.getCell(cIdx);
+              c.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFFEF9C3' }, // Soft pastel cream (not gaudy)
+              };
+              c.font = {
+                name: 'Consolas',
+                size: 10,
+                bold: true,
+                color: { argb: 'FF713F12' },
+              };
+            });
+          };
+
+          if (r.diffFields.counter) highlightDiffPair(3, 4);
+          if (r.diffFields.scenarioName) highlightDiffPair(5, 6);
+          if (r.diffFields.releaseType) highlightDiffPair(7, 8);
+          if (r.diffFields.releaseObject) highlightDiffPair(9, 10);
+        }
+      });
+    };
+
+    const diffsOnly = summary.rows.filter(r => r.status !== 'MATCH');
+    if (diffsOnly.length > 0) {
+      buildSheet('เฉพาะจุดต่าง (Discrepancies)', diffsOnly);
+    }
+    buildSheet('ข้อมูลทั้งหมด (All Aligned)', summary.rows);
+
+    const onlyTbRows = summary.rows.filter(r => r.status === 'ONLY_TB');
+    if (onlyTbRows.length > 0) {
+      buildSheet('มีเฉพาะ TB (Missing in PRD)', onlyTbRows);
     }
 
-    // 3. Only in A & Only in B
-    const onlyAData = result.rows
-      .filter(r => r.status === 'only_a')
-      .map(r => ({ 'บรรทัดเดิม (A)': r.lineNumA, 'Key': r.keyVal, 'ข้อมูลฝั่ง A': r.contentA }));
-    if (onlyAData.length > 0) {
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(onlyAData), 'Only_In_A');
+    const onlyProdRows = summary.rows.filter(r => r.status === 'ONLY_PROD');
+    if (onlyProdRows.length > 0) {
+      buildSheet('มีเฉพาะ PRD (Extra in PRD)', onlyProdRows);
     }
 
-    const onlyBData = result.rows
-      .filter(r => r.status === 'only_b')
-      .map(r => ({ 'บรรทัดเดิม (B)': r.lineNumB, 'Key': r.keyVal, 'ข้อมูลฝั่ง B': r.contentB }));
-    if (onlyBData.length > 0) {
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(onlyBData), 'Only_In_B');
-    }
-
-    XLSX.writeFile(wb, `Aligned_Comparison_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Scenario_Release_Diff_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
-  // Copy filtered rows to clipboard
-  const copyAlignedToClipboard = () => {
+  // Copy pipe-delimited lines of currently filtered view
+  const handleCopyFilteredPipe = (targetSide: 'TB' | 'PROD' | 'BOTH') => {
     if (filteredRows.length === 0) return;
-    const header = ['ลำดับ', 'สถานะ', 'บรรทัด A', 'ข้อมูลฝั่ง A', 'บรรทัด B', 'ข้อมูลฝั่ง B'].join('\t');
-    const lines = filteredRows.map(r =>
-      [r.index, r.status.toUpperCase(), r.lineNumA ?? '-', r.contentA, r.lineNumB ?? '-', r.contentB].join('\t')
-    );
-    navigator.clipboard.writeText([header, ...lines].join('\n'));
-    setCopiedState('table');
-    setTimeout(() => setCopiedState(null), 2000);
+    const header =
+      'Counter|Scenario Name|Release Type(B: BE; R: Brand; P: Primary Offering; O: Supplementary Offering)|Release Object';
+
+    let text = '';
+    if (targetSide === 'TB') {
+      const lines = filteredRows
+        .map(r => r.tbRecord?.rawLine)
+        .filter((l): l is string => Boolean(l));
+      text = [header, ...lines].join('\n');
+    } else if (targetSide === 'PROD') {
+      const lines = filteredRows
+        .map(r => r.prodRecord?.rawLine)
+        .filter((l): l is string => Boolean(l));
+      text = [header, ...lines].join('\n');
+    } else {
+      const tsvHeader = [
+        'Status',
+        'TB_Line',
+        'TB_Counter',
+        'TB_ScenarioName',
+        'TB_ReleaseType',
+        'TB_ReleaseObject',
+        'PRD_Line',
+        'PRD_Counter',
+        'PRD_ScenarioName',
+        'PRD_ReleaseType',
+        'PRD_ReleaseObject',
+      ].join('\t');
+      const lines = filteredRows.map(r =>
+        [
+          r.status,
+          r.tbRecord?.lineNumber ?? '-',
+          r.tbRecord?.counter ?? '-',
+          r.tbRecord?.scenarioName ?? '-',
+          r.tbRecord?.releaseType ?? '-',
+          r.tbRecord?.releaseObject ?? '-',
+          r.prodRecord?.lineNumber ?? '-',
+          r.prodRecord?.counter ?? '-',
+          r.prodRecord?.scenarioName ?? '-',
+          r.prodRecord?.releaseType ?? '-',
+          r.prodRecord?.releaseObject ?? '-',
+        ].join('\t')
+      );
+      text = [tsvHeader, ...lines].join('\n');
+    }
+
+    navigator.clipboard.writeText(text);
+    setCopiedId(targetSide);
+    setTimeout(() => setCopiedId(null), 2000);
   };
 
   return (
-    <div className="relative min-h-screen overflow-x-hidden bg-[#0a0c0f] pb-24 text-white">
-      <style jsx global>{`
-        @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@700;800&display=swap');
-        .font-display { font-family: 'Syne', sans-serif; }
-        .font-mono-custom { font-family: 'Space Mono', monospace; }
+    <div className="min-h-screen bg-[#080c14] pb-24 text-slate-100 font-sans selection:bg-emerald-500/30">
+      <div className="pointer-events-none fixed inset-x-0 top-0 h-64 bg-gradient-to-b from-emerald-950/20 via-slate-900/5 to-transparent" />
 
-        @keyframes fade-up {
-          from { opacity: 0; transform: translateY(16px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-        .fade-up { opacity: 0; animation: fade-up 0.55s cubic-bezier(0.16,1,0.3,1) forwards; }
-
-        @keyframes scan {
-          0%   { transform: translateY(-100%); opacity: 0; }
-          10%  { opacity: 1; }
-          90%  { opacity: 1; }
-          100% { transform: translateY(100vh); opacity: 0; }
-        }
-        .scan-line { animation: scan 8s ease-in-out infinite; }
-
-        @keyframes pulse-dot {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50%       { opacity: 0.4; transform: scale(0.7); }
-        }
-        .pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
-
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(52,211,153,0.2); border-radius: 10px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(52,211,153,0.4); }
-      `}</style>
-
-      {/* Dot grid canvas */}
-      <canvas ref={canvasRef} className="pointer-events-none fixed inset-0 opacity-100" />
-      {/* Scan line */}
-      <div className="scan-line pointer-events-none fixed left-0 top-0 z-10 h-[2px] w-full bg-gradient-to-r from-transparent via-emerald-400/20 to-transparent" />
-      {/* Radial glow */}
-      <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(ellipse_80%_50%_at_50%_0%,rgba(16,185,129,0.06),transparent)]" />
-
-      <div className="relative z-10 mx-auto max-w-7xl px-6 py-10">
-
-        {/* ── HEADER ── */}
-        <header className="fade-up mb-8" style={{ animationDelay: '0ms' }}>
-          <div className="mb-6 flex items-center gap-3">
-            <div className="h-px flex-1 bg-white/[0.06]" />
-            <span className="font-mono-custom text-[10px] tracking-[0.3em] text-white/25">BILLONE · SMART FILE COMPARATOR</span>
-            <div className="h-px flex-1 bg-white/[0.06]" />
-          </div>
-
-          <div className="flex flex-wrap items-start justify-between gap-4">
+      <div className="relative z-10 mx-auto max-w-[1500px] px-4 py-5 sm:px-6">
+        {/* ── TOP HEADER ── */}
+        <header className="mb-5 flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
+          <div className="flex items-center gap-3">
+            <Link
+              href="/mainocs"
+              className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-300 transition hover:border-white/25 hover:bg-white/10 hover:text-white"
+            >
+              <ArrowLeft size={14} />
+              กลับหน้าหลัก
+            </Link>
             <div>
-              <Link
-                href="/mainocs"
-                className="group mb-4 inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2 font-mono-custom text-[11px] tracking-widest text-white/40 transition-all hover:border-white/20 hover:text-white/70"
-              >
-                <ArrowLeft size={12} className="transition-transform group-hover:-translate-x-0.5" />
-                BACK TO HUB
-              </Link>
-              <h1 className="font-display text-4xl font-extrabold leading-tight tracking-tight text-white">
-                Smart <span className="bg-gradient-to-r from-amber-400 via-emerald-300 to-sky-400 bg-clip-text text-transparent">Comparator</span>
-              </h1>
-              <p className="mt-1.5 font-mono-custom text-xs text-white/40">
-                จัดเรียงบรรทัดที่เหมือนกันให้ตรงกันอัตโนมัติ · ไฮไลต์จุดต่างระดับคำ · รองรับทั้งอัปโหลดไฟล์และวางข้อความ
+              <div className="flex items-center gap-2">
+                <GitCompare size={20} className="text-emerald-400" />
+                <h1 className="text-lg font-bold tracking-tight text-white sm:text-xl">
+                  Scenario Release Comparator — <span className="text-amber-300">Testbase (TB)</span> vs{' '}
+                  <span className="text-sky-300">Production (PRD)</span>
+                </h1>
+              </div>
+              <p className="mt-0.5 font-mono text-[11px] text-slate-400">
+                Format: Counter | Scenario Name | Release Type (B/R/P/O) | Release Object
               </p>
             </div>
+          </div>
 
-            {/* Status pill */}
-            <div className="mt-1 flex shrink-0 items-center gap-2.5 rounded-2xl border border-white/10 bg-white/5 px-5 py-3 backdrop-blur-sm">
-              <div className={`pulse-dot h-2 w-2 rounded-full ${status.startsWith('✓') ? 'bg-emerald-400' : isProcessing ? 'bg-amber-400' : 'bg-sky-400'}`} />
-              <span className="font-mono-custom text-[11px] text-white/70">{status}</span>
-            </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleLoadSample}
+              className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/15 px-3.5 py-2 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/25"
+            >
+              <Sparkles size={14} />
+              โหลดข้อมูลตัวอย่าง (TB vs PRD)
+            </button>
+            {(tbText || prodText) && (
+              <button
+                onClick={() => {
+                  setTbText('');
+                  setProdText('');
+                  setTbFileName('');
+                  setProdFileName('');
+                }}
+                className="flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs font-semibold text-rose-300 transition hover:bg-rose-500/20"
+              >
+                <Trash2 size={14} />
+                ล้างข้อมูล
+              </button>
+            )}
           </div>
         </header>
 
-        {/* ── MODE SELECTOR BAR ── */}
-        <div className="fade-up mb-6 grid grid-cols-1 gap-3 md:grid-cols-3" style={{ animationDelay: '40ms' }}>
-          {[
-            {
-              id: 'smart_align' as CompareMode,
-              icon: Layers,
-              title: '1. จัดเรียงจับคู่อัตโนมัติ (แนะนำ)',
-              desc: 'ดึงบรรทัดที่เหมือนกันมาวางคู่กันให้อัตโนมัติ แม้ลำดับบรรทัดในไฟล์จะสลับกัน'
-            },
-            {
-              id: 'key_match' as CompareMode,
-              icon: Key,
-              title: '2. จับคู่ด้วยคอลัมน์ Key / รหัส',
-              desc: 'เรียงและจับคู่บรรทัดโดยยึดรหัสอ้างอิง (เช่น เบอร์โทร, Promo ID) ให้ตรงกัน'
-            },
-            {
-              id: 'line_by_line' as CompareMode,
-              icon: SortAsc,
-              title: '3. เทียบบรรทัดต่อบรรทัด (1:1)',
-              desc: 'เทียบตามลำดับบรรทัดที่ 1, 2, 3... (เลือกเปิดเรียง A-Z ก่อนเทียบได้)'
-            }
-          ].map(m => {
-            const Icon = m.icon;
-            const active = compareMode === m.id;
+        {/* ── INPUT PANELS: TESTBASE (TB) & PRODUCTION (PROD) ── */}
+        <div className="mb-5 grid grid-cols-1 gap-3 lg:grid-cols-11 items-stretch">
+          {(['TB', 'PROD'] as const).map((side, idx) => {
+            const isTb = side === 'TB';
+            const rawVal = isTb ? tbText : prodText;
+            const setRawVal = isTb ? setTbText : setProdText;
+            const fileName = isTb ? tbFileName : prodFileName;
+            const mode = isTb ? tbMode : prodMode;
+            const setMode = isTb ? setTbMode : setProdMode;
+            const lineCount = isTb ? summary?.totalTbLines ?? 0 : summary?.totalProdLines ?? 0;
+            const isDragging = dragSide === side;
+
             return (
-              <button
-                key={m.id}
-                onClick={() => setCompareMode(m.id)}
-                className={`flex items-start gap-3.5 rounded-2xl border p-4 text-left transition-all ${
-                  active
-                    ? 'border-emerald-500/40 bg-emerald-500/10 shadow-[0_0_25px_rgba(16,185,129,0.12)]'
-                    : 'border-white/10 bg-white/[0.03] hover:border-white/20 hover:bg-white/[0.05]'
-                }`}
-              >
-                <div className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border ${active ? 'border-emerald-400/40 bg-emerald-500/20 text-emerald-300' : 'border-white/10 bg-white/5 text-white/40'}`}>
-                  <Icon size={17} />
-                </div>
-                <div>
-                  <div className={`font-mono-custom text-xs font-bold ${active ? 'text-emerald-300' : 'text-white/80'}`}>
-                    {m.title}
+              <React.Fragment key={side}>
+                {idx === 1 && (
+                  <div className="flex lg:flex-col items-center justify-center py-1">
+                    <button
+                      onClick={handleSwap}
+                      title="สลับข้อมูลระหว่าง Testbase (TB) ⇄ Production (PRD)"
+                      className="flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-slate-800 text-slate-300 shadow transition hover:scale-105 hover:border-emerald-400 hover:text-emerald-300"
+                    >
+                      <ArrowRightLeft size={15} />
+                    </button>
                   </div>
-                  <p className="mt-1 text-[11px] leading-relaxed text-white/40">{m.desc}</p>
+                )}
+
+                <div
+                  onDragOver={e => {
+                    e.preventDefault();
+                    setDragSide(side);
+                  }}
+                  onDragLeave={() => setDragSide(null)}
+                  onDrop={e => {
+                    e.preventDefault();
+                    setDragSide(null);
+                    const file = e.dataTransfer.files?.[0];
+                    if (file) handleFileUpload(file, side);
+                  }}
+                  className={`lg:col-span-5 flex flex-col justify-between rounded-xl border p-3.5 transition ${
+                    isDragging
+                      ? 'border-emerald-400 bg-emerald-500/10'
+                      : rawVal.trim()
+                      ? isTb
+                        ? 'border-amber-500/35 bg-amber-500/[0.03]'
+                        : 'border-sky-500/35 bg-sky-500/[0.03]'
+                      : 'border-white/10 bg-slate-900/60'
+                  }`}
+                >
+                  <div className="mb-2.5 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`rounded-md px-2.5 py-0.5 text-xs font-bold ${
+                          isTb
+                            ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                            : 'bg-sky-500/20 text-sky-300 border border-sky-500/30'
+                        }`}
+                      >
+                        {isTb ? 'TESTBASE (TB)' : 'PRODUCTION (PRD)'}
+                      </span>
+                      {rawVal.trim() && (
+                        <span className="font-mono text-xs text-slate-400">
+                          {lineCount.toLocaleString()} records
+                          {fileName ? ` · ${fileName}` : ''}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-black/40 p-0.5 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setMode('paste')}
+                        className={`flex items-center gap-1 rounded px-2 py-1 font-medium transition ${
+                          mode === 'paste' ? 'bg-white/15 text-white' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <ClipboardPaste size={12} /> วางข้อความ Pipe (|)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMode('file')}
+                        className={`flex items-center gap-1 rounded px-2 py-1 font-medium transition ${
+                          mode === 'file' ? 'bg-white/15 text-white' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <Upload size={12} /> อัปโหลดไฟล์
+                      </button>
+                    </div>
+                  </div>
+
+                  {mode === 'paste' ? (
+                    <textarea
+                      rows={5}
+                      spellCheck={false}
+                      placeholder={`วางข้อมูล ${isTb ? 'Testbase (TB)' : 'Production (PRD)'} ที่คั่นด้วย | ที่นี่...\nตัวอย่าง: SO_Speed_30M|SCE_SO_PPS_30M_63210012|O|C_SO_63210012`}
+                      value={rawVal}
+                      onChange={e => setRawVal(e.target.value)}
+                      className="w-full rounded-lg border border-white/10 bg-black/40 p-2.5 font-mono text-xs leading-relaxed text-slate-100 placeholder:text-slate-600 focus:border-emerald-500/50 focus:outline-none"
+                    />
+                  ) : (
+                    <div>
+                      <input
+                        type="file"
+                        id={`upload-${side}`}
+                        accept=".txt,.csv,.log,.dat,.xlsx,.xls"
+                        className="hidden"
+                        onChange={e => {
+                          const f = e.target.files?.[0];
+                          if (f) handleFileUpload(f, side);
+                        }}
+                      />
+                      <div
+                        onClick={() => document.getElementById(`upload-${side}`)?.click()}
+                        className="flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-white/15 bg-black/30 py-6 text-center transition hover:border-white/30 hover:bg-white/[0.04]"
+                      >
+                        <FileText size={22} className={isTb ? 'text-amber-400 mb-1.5' : 'text-sky-400 mb-1.5'} />
+                        <p className="text-xs font-semibold text-white">
+                          {fileName ? fileName : `คลิกเลือกไฟล์ฝั่ง ${isTb ? 'TB' : 'PRD'} หรือลากไฟล์มาวาง`}
+                        </p>
+                        <p className="mt-0.5 text-[11px] text-slate-400">
+                          รองรับไฟล์ .txt, .csv (Pipe-delimited) และ .xlsx
+                        </p>
+                      </div>
+                    </div>
+                  )}
                 </div>
-              </button>
+              </React.Fragment>
             );
           })}
         </div>
 
-        {/* ── CONFIG & INPUT CARD ── */}
-        <div className="fade-up mb-6 rounded-2xl border border-white/10 bg-white/[0.04] p-6 backdrop-blur-sm" style={{ animationDelay: '80ms' }}>
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-
-            {/* File Slots (8 cols) */}
-            <div className="lg:col-span-8 grid grid-cols-1 gap-4 md:grid-cols-2 relative">
-              {/* Swap Button between A and B */}
+        {/* ── ENGINE CONTROL BAR ── */}
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-slate-900/90 px-4 py-2.5 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-slate-400">เกณฑ์การจับคู่ (Alignment Key):</span>
+            {(
+              [
+                {
+                  id: 'SCENARIO_AND_OBJECT',
+                  label: '✨ Smart Align (Scenario + Object + Fallback)',
+                },
+                {
+                  id: 'SCENARIO_ONLY',
+                  label: 'ยึด Scenario Name เป็นหลัก',
+                },
+                {
+                  id: 'COUNTER_AND_OBJECT',
+                  label: 'ยึด Counter + Release Object',
+                },
+                {
+                  id: 'FULL_ROW',
+                  label: 'เทียบตรงทั้ง 4 คอลัมน์เท่านั้น (Exact 4-Tuple)',
+                },
+              ] as { id: CompositeKeyStrategy; label: string }[]
+            ).map(st => (
               <button
-                onClick={handleSwapFiles}
-                title="สลับข้อมูลฝั่ง A กับ B"
-                className="hidden md:flex absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-20 h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-[#12161f] text-white/60 shadow-lg transition-all hover:scale-110 hover:border-emerald-400/50 hover:text-emerald-300"
+                key={st.id}
+                onClick={() => setOptions(o => ({ ...o, keyStrategy: st.id }))}
+                className={`rounded-lg px-2.5 py-1.5 font-medium transition ${
+                  options.keyStrategy === st.id
+                    ? 'bg-emerald-500 text-slate-950 font-bold'
+                    : 'bg-white/5 text-slate-300 hover:bg-white/10'
+                }`}
               >
-                <ArrowRightLeft size={14} />
+                {st.label}
               </button>
+            ))}
+          </div>
 
-              {([fileA, fileB] as FileState[]).map((f, i) => {
-                const side: 'A' | 'B' = i === 0 ? 'A' : 'B';
-                const tag = side === 'A' ? 'SOURCE A (ต้นฉบับ)' : 'SOURCE B (ไฟล์เทียบ)';
-                const isDragging = dragOverSide === side;
-                const accentA = 'border-amber-500/35 bg-amber-500/[0.04]';
-                const accentB = 'border-sky-500/35 bg-sky-500/[0.04]';
-                const hasData = f.content.length > 0;
-                const accent = isDragging
-                  ? 'border-emerald-400 bg-emerald-500/10'
-                  : hasData
-                  ? i === 0
-                    ? accentA
-                    : accentB
-                  : 'border-white/10 bg-white/[0.02]';
+          <div className="flex flex-wrap items-center gap-4 text-slate-300">
+            <label className="flex cursor-pointer items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={options.trimWhitespace}
+                onChange={e => setOptions(o => ({ ...o, trimWhitespace: e.target.checked }))}
+                className="h-3.5 w-3.5 rounded accent-emerald-500"
+              />
+              Trim ช่องว่าง
+            </label>
+            <label className="flex cursor-pointer items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={options.deduplicateExactLines}
+                onChange={e => setOptions(o => ({ ...o, deduplicateExactLines: e.target.checked }))}
+                className="h-3.5 w-3.5 rounded accent-emerald-500"
+              />
+              ตัดบรรทัดซ้ำซ้อน (Deduplicate)
+            </label>
+            <label className="flex cursor-pointer items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={options.caseSensitive}
+                onChange={e => setOptions(o => ({ ...o, caseSensitive: e.target.checked }))}
+                className="h-3.5 w-3.5 rounded accent-emerald-500"
+              />
+              Case-Sensitive
+            </label>
+          </div>
+        </div>
 
+        {/* ── DIFF RESULTS & STRUCTURED 4-COLUMN TABLE ── */}
+        {summary ? (
+          <div className="space-y-4">
+            {/* 1. Status Filter Cards */}
+            <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-6">
+              {[
+                {
+                  id: 'DIFF_ONLY' as const,
+                  label: 'จุดต่างทั้งหมด (All Diffs)',
+                  count:
+                    summary.modifiedCount +
+                    summary.onlyTbCount +
+                    summary.onlyProdCount +
+                    summary.malformedCount,
+                  sub: 'รายการที่ต้องตรวจสอบ',
+                  cls: 'border-rose-500/40 bg-rose-500/10 text-rose-300',
+                  icon: AlertTriangle,
+                },
+                {
+                  id: 'MODIFIED' as const,
+                  label: 'ค่าไม่ตรงกัน (Modified)',
+                  count: summary.modifiedCount,
+                  sub: 'Counter / Type / Object ต่างกัน',
+                  cls: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+                  icon: GitCompare,
+                },
+                {
+                  id: 'ONLY_TB' as const,
+                  label: 'มีเฉพาะ TB (Missing in PRD)',
+                  count: summary.onlyTbCount,
+                  sub: 'ยังไม่ได้ขึ้น Production',
+                  cls: 'border-orange-500/40 bg-orange-500/10 text-orange-300',
+                  icon: MinusCircle,
+                },
+                {
+                  id: 'ONLY_PROD' as const,
+                  label: 'มีเฉพาะ PRD (Extra in PRD)',
+                  count: summary.onlyProdCount,
+                  sub: 'ไม่มีในไฟล์ Testbase รอบนี้',
+                  cls: 'border-sky-500/40 bg-sky-500/10 text-sky-300',
+                  icon: PlusCircle,
+                },
+                {
+                  id: 'MATCH' as const,
+                  label: `ตรงกัน (${summary.matchPercentage}%)`,
+                  count: summary.matchCount,
+                  sub: 'ทั้ง 4 คอลัมน์ตรงกัน 100%',
+                  cls: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
+                  icon: CheckCircle2,
+                },
+                {
+                  id: 'ALL' as const,
+                  label: 'รวมทั้งหมด (All Rows)',
+                  count: summary.totalAlignedRows,
+                  sub: `ประมวลผลใน ${summary.executionTimeMs} ms`,
+                  cls: 'border-slate-500/40 bg-slate-500/10 text-slate-200',
+                  icon: Clock,
+                },
+              ].map(card => {
+                const Icon = card.icon;
+                const active = statusFilter === card.id;
                 return (
-                  <div
-                    key={side}
-                    onDragOver={e => {
-                      e.preventDefault();
-                      setDragOverSide(side);
-                    }}
-                    onDragLeave={() => setDragOverSide(null)}
-                    onDrop={e => {
-                      e.preventDefault();
-                      setDragOverSide(null);
-                      const droppedFile = e.dataTransfer.files?.[0];
-                      if (droppedFile) processUploadedFile(droppedFile, side);
-                    }}
-                    className={`flex flex-col justify-between rounded-xl border-2 border-dashed p-5 transition-all duration-300 ${accent}`}
+                  <button
+                    key={card.id}
+                    onClick={() => setStatusFilter(card.id)}
+                    className={`flex flex-col justify-between rounded-xl border p-3 text-left transition ${
+                      active
+                        ? `${card.cls} ring-2 ring-white/20 shadow-md`
+                        : 'border-white/10 bg-slate-900/60 text-slate-300 hover:bg-slate-800/70'
+                    }`}
                   >
-                    <div>
-                      {/* Top bar: Tag + Mode Toggle */}
-                      <div className="mb-4 flex items-center justify-between gap-2">
-                        <span
-                          className={`rounded-md border px-2.5 py-1 font-mono-custom text-[10px] font-bold tracking-[0.15em] ${
-                            i === 0
-                              ? 'border-amber-500/30 bg-amber-500/10 text-amber-400'
-                              : 'border-sky-500/30 bg-sky-500/10 text-sky-400'
-                          }`}
-                        >
-                          {tag}
-                        </span>
-
-                        <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-black/30 p-0.5">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              (side === 'A' ? setFileA : setFileB)(prev => ({ ...prev, inputMode: 'file' }))
-                            }
-                            className={`flex items-center gap-1 rounded-md px-2 py-1 font-mono-custom text-[10px] transition-all ${
-                              f.inputMode === 'file'
-                                ? 'bg-white/15 text-white'
-                                : 'text-white/40 hover:text-white/70'
-                            }`}
-                          >
-                            <Upload size={11} /> ไฟล์
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              (side === 'A' ? setFileA : setFileB)(prev => ({ ...prev, inputMode: 'paste' }))
-                            }
-                            className={`flex items-center gap-1 rounded-md px-2 py-1 font-mono-custom text-[10px] transition-all ${
-                              f.inputMode === 'paste'
-                                ? 'bg-white/15 text-white'
-                                : 'text-white/40 hover:text-white/70'
-                            }`}
-                          >
-                            <ClipboardPaste size={11} /> วางข้อความ
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* File Upload Mode */}
-                      {f.inputMode === 'file' ? (
-                        <div>
-                          <input
-                            type="file"
-                            id={`f-${side}`}
-                            accept=".xlsx,.xls,.csv,.txt,.log,.sql,.json"
-                            className="hidden"
-                            onChange={e => handleFileChange(e, side)}
-                          />
-                          <div
-                            onClick={() => document.getElementById(`f-${side}`)?.click()}
-                            className="group cursor-pointer rounded-xl border border-white/10 bg-black/20 p-4 text-center transition-all hover:border-white/25 hover:bg-white/[0.04]"
-                          >
-                            <div className="mx-auto mb-2 flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-white/50 group-hover:text-white">
-                              {f.isExcel ? <TableIcon size={16} /> : <FileText size={16} />}
-                            </div>
-                            <p className="truncate font-mono-custom text-xs font-bold text-white/80">
-                              {f.file ? f.name : 'คลิกเลือกไฟล์ หรือลากไฟล์มาวาง'}
-                            </p>
-                            <p className="mt-1 font-mono-custom text-[10px] text-white/35">
-                              {f.file
-                                ? `${f.content.length.toLocaleString()} แถว ${
-                                    f.isExcel ? `· ${f.headers.length} คอลัมน์` : ''
-                                  }`
-                                : 'รองรับ Excel (.xlsx, .csv) และ Text (.txt, .sql)'}
-                            </p>
-                          </div>
-                        </div>
-                      ) : (
-                        /* Paste Text Mode */
-                        <div>
-                          <textarea
-                            rows={4}
-                            placeholder={`วางข้อมูลฝั่ง ${side} ที่นี่ (ก๊อปปี้จาก Excel หรือ Notepad มาวางได้เลย)...`}
-                            value={f.pastedText}
-                            onChange={e => handlePasteChange(e.target.value, side)}
-                            className="w-full rounded-xl border border-white/10 bg-black/30 p-3 font-mono-custom text-xs text-white/80 placeholder:text-white/25 focus:border-emerald-500/40 focus:outline-none"
-                          />
-                          <p className="mt-1 font-mono-custom text-[10px] text-white/35">
-                            {f.content.length > 0
-                              ? `รับข้อมูลแล้ว ${f.content.length.toLocaleString()} บรรทัด`
-                              : 'รองรับ Tab-separated จาก Excel และข้อความทีละบรรทัด'}
-                          </p>
-                        </div>
-                      )}
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="text-[11px] font-semibold opacity-90">{card.label}</span>
+                      <Icon size={14} className="shrink-0 opacity-80" />
                     </div>
-
-                    {/* Excel Sheet & Column Pickers */}
-                    {f.content.length > 0 && (
-                      <div className="mt-3 space-y-2 border-t border-white/10 pt-3">
-                        {/* Sheet selector if multiple sheets */}
-                        {f.sheetNames.length > 1 && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-mono-custom text-[10px] text-white/40">Sheet:</span>
-                            <select
-                              className="flex-1 rounded-lg border border-white/10 bg-[#0a0c0f] px-2.5 py-1.5 font-mono-custom text-[11px] text-white/70 outline-none focus:border-emerald-500/40"
-                              value={f.selectedSheet}
-                              onChange={e => handleSheetChange(e.target.value, side)}
-                            >
-                              {f.sheetNames.map(s => (
-                                <option key={s} value={s}>
-                                  {s}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        )}
-
-                        {/* Key Column Selector (when in key_match or smart_align with Excel) */}
-                        {f.isExcel && f.headers.length > 0 && (
-                          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                            <div>
-                              <label className="mb-1 block font-mono-custom text-[10px] text-white/40">
-                                คอลัมน์อ้างอิง (Key):
-                              </label>
-                              <select
-                                className="w-full rounded-lg border border-white/10 bg-[#0a0c0f] px-2.5 py-1.5 font-mono-custom text-[11px] text-emerald-300/90 outline-none focus:border-emerald-500/40"
-                                value={side === 'A' ? keyColA : keyColB}
-                                onChange={e =>
-                                  side === 'A' ? setKeyColA(e.target.value) : setKeyColB(e.target.value)
-                                }
-                              >
-                                <option value="">— คอลัมน์แรก ({f.headers[0] || 'Col 1'}) —</option>
-                                {f.headers.map((h, idx) => (
-                                  <option key={idx} value={h}>
-                                    {h}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-
-                            <div>
-                              <label className="mb-1 block font-mono-custom text-[10px] text-white/40">
-                                คอลัมน์ที่จะเทียบค่า:
-                              </label>
-                              <select
-                                className="w-full rounded-lg border border-white/10 bg-[#0a0c0f] px-2.5 py-1.5 font-mono-custom text-[11px] text-white/70 outline-none focus:border-emerald-500/40"
-                                value={side === 'A' ? selectedColA : selectedColB}
-                                onChange={e =>
-                                  side === 'A'
-                                    ? setSelectedColA(e.target.value)
-                                    : setSelectedColB(e.target.value)
-                                }
-                              >
-                                <option value="">— เทียบทั้งแถว (Full Row) —</option>
-                                {f.headers.map((h, idx) => (
-                                  <option key={idx} value={h}>
-                                    {h}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
+                    <div className="mt-1.5 text-2xl font-extrabold text-white">
+                      {card.count.toLocaleString()}
+                    </div>
+                    <div className="mt-0.5 text-[10px] opacity-70">{card.sub}</div>
+                  </button>
                 );
               })}
             </div>
 
-            {/* Settings + Run Button (4 cols) */}
-            <div className="lg:col-span-4 flex flex-col justify-between rounded-xl border border-white/[0.08] bg-white/[0.02] p-5">
-              <div>
-                <div className="mb-4 flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Settings2 size={14} className="text-emerald-400/70" />
-                    <span className="font-mono-custom text-[10px] font-bold tracking-[0.2em] text-white/50">
-                      ALIGNMENT & OPTIONS
-                    </span>
-                  </div>
-                  {(fileA.content.length > 0 || fileB.content.length > 0) && (
-                    <button
-                      onClick={() => {
-                        setFileA(INITIAL_FILE_STATE);
-                        setFileB(INITIAL_FILE_STATE);
-                        setResult(null);
-                        setStatus('ล้างข้อมูลแล้ว');
-                      }}
-                      className="flex items-center gap-1 font-mono-custom text-[10px] text-rose-400/70 hover:text-rose-300"
-                    >
-                      <Trash2 size={11} /> ล้างทั้งหมด
-                    </button>
-                  )}
+            {/* Edge-case Warning Banner (Malformed lines or Duplicate rows) */}
+            {(summary.malformedCount > 0 ||
+              summary.duplicateTbCount > 0 ||
+              summary.duplicateProdCount > 0) && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200">
+                <div className="flex items-center gap-2">
+                  <ShieldAlert size={16} className="text-amber-400 shrink-0" />
+                  <span>
+                    <strong>ตรวจพบข้อสังเกตในไฟล์ข้อมูล:</strong>{' '}
+                    {summary.malformedCount > 0 && (
+                      <span className="mr-3 underline">
+                        บรรทัดที่คอลัมน์ไม่ครบ 4 ช่อง: {summary.malformedCount} รายการ
+                      </span>
+                    )}
+                    {(summary.duplicateTbCount > 0 || summary.duplicateProdCount > 0) && (
+                      <span>
+                        บรรทัดซ้ำซ้อนทั้งหมด (TB ซ้ำ {summary.duplicateTbCount} บรรทัด / PRD ซ้ำ{' '}
+                        {summary.duplicateProdCount} บรรทัด)
+                      </span>
+                    )}
+                  </span>
                 </div>
-
-                <div className="space-y-3">
-                  {[
-                    {
-                      key: 'sortBeforeCompare',
-                      label: 'จัดเรียงบรรทัดให้ตรงกันอัตโนมัติ (Sort A-Z)',
-                      desc: 'เรียงลำดับข้อมูลให้ตรงกันก่อนตรวจหาจุดต่าง'
-                    },
-                    {
-                      key: 'trimWhitespace',
-                      label: 'ตัดช่องว่างเกินหน้า-หลัง (Auto-trim)',
-                      desc: 'ลดปัญหาเคาะ Space เกินทำให้ขึ้นว่าไม่ตรง'
-                    },
-                    {
-                      key: 'ignoreEmptyLines',
-                      label: 'ข้ามบรรทัดว่าง (Ignore empty rows)',
-                      desc: 'ไม่นำบรรทัดที่ว่างเปล่ามาคิดเป็นจุดต่าง'
-                    },
-                    {
-                      key: 'skipHeaderRow',
-                      label: 'ข้ามแถวหัวตาราง Excel (Skip Header)',
-                      desc: 'เริ่มเทียบตั้งแต่แถวข้อมูลจริงในไฟล์ Excel'
-                    },
-                    {
-                      key: 'caseSensitive',
-                      label: 'แยกตัวพิมพ์เล็ก-ใหญ่ (Case sensitive)',
-                      desc: 'หากปิดไว้ ABC กับ abc จะถือว่าตรงกัน'
-                    }
-                  ].map(opt => {
-                    const checked = settings[opt.key as keyof typeof settings];
-                    return (
-                      <label
-                        key={opt.key}
-                        onClick={() =>
-                          setSettings(s => ({ ...s, [opt.key]: !s[opt.key as keyof typeof s] }))
-                        }
-                        className="flex cursor-pointer items-start gap-3 rounded-lg p-1.5 transition-colors hover:bg-white/[0.03]"
-                      >
-                        <div
-                          className={`mt-0.5 relative h-5 w-9 shrink-0 rounded-full border transition-all ${
-                            checked
-                              ? 'border-emerald-500/50 bg-emerald-500/25'
-                              : 'border-white/15 bg-white/5'
-                          }`}
-                        >
-                          <div
-                            className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition-all ${
-                              checked ? 'left-4 bg-emerald-400' : 'left-0.5 bg-white/30'
-                            }`}
-                          />
-                        </div>
-                        <div>
-                          <div className="font-mono-custom text-[11px] font-bold text-white/80">
-                            {opt.label}
-                          </div>
-                          <div className="text-[10px] text-white/35">{opt.desc}</div>
-                        </div>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <button
-                onClick={handleCompare}
-                disabled={!isReady || isProcessing}
-                className="relative mt-5 w-full overflow-hidden rounded-xl border border-emerald-500/40 bg-emerald-500/20 py-3.5 font-mono-custom text-xs font-bold tracking-[0.2em] text-emerald-300 shadow-[0_0_25px_rgba(16,185,129,0.15)] transition-all hover:bg-emerald-500/30 hover:border-emerald-400 disabled:pointer-events-none disabled:opacity-25"
-              >
-                {isProcessing ? 'กำลังจัดเรียงและเปรียบเทียบ...' : '⚡ จัดเรียงและเปรียบเทียบทันที'}
-                <div className="absolute bottom-0 left-0 h-[1px] w-full bg-gradient-to-r from-transparent via-emerald-400 to-transparent" />
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* ── RESULTS SECTION ── */}
-        {result && (
-          <div className="fade-up space-y-5" style={{ animationDelay: '0ms' }}>
-
-            {/* Summary KPI Cards (Clickable to filter!) */}
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-              <button
-                onClick={() => setStatusFilter('all')}
-                className={`rounded-xl border p-4 text-left transition-all ${
-                  statusFilter === 'all'
-                    ? 'border-white/30 bg-white/10'
-                    : 'border-white/[0.06] bg-white/[0.03] hover:bg-white/[0.05]'
-                }`}
-              >
-                <p className="font-mono-custom text-[10px] tracking-[0.15em] text-white/40">
-                  ทั้งหมดที่นำมาเรียงเทียบ
-                </p>
-                <p className="mt-1 font-display text-2xl font-extrabold text-white">
-                  {result.totalAligned.toLocaleString()}
-                </p>
-                <p className="mt-0.5 font-mono-custom text-[10px] text-emerald-400">
-                  ความเหมือน {matchPct}%
-                </p>
-              </button>
-
-              <button
-                onClick={() => setStatusFilter('match')}
-                className={`rounded-xl border p-4 text-left transition-all ${
-                  statusFilter === 'match'
-                    ? 'border-emerald-500/50 bg-emerald-500/15'
-                    : 'border-white/[0.06] bg-white/[0.03] hover:bg-white/[0.05]'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="font-mono-custom text-[10px] tracking-[0.15em] text-emerald-400/80">
-                    ตรงกัน (MATCH)
-                  </p>
-                  <CheckCircle2 size={14} className="text-emerald-400" />
-                </div>
-                <p className="mt-1 font-display text-2xl font-extrabold text-emerald-400">
-                  {result.matchCount.toLocaleString()}
-                </p>
-                <p className="mt-0.5 font-mono-custom text-[10px] text-white/35">คลิกเพื่อดูรายการที่ตรงกัน</p>
-              </button>
-
-              <button
-                onClick={() => setStatusFilter('modified')}
-                className={`rounded-xl border p-4 text-left transition-all ${
-                  statusFilter === 'modified'
-                    ? 'border-rose-500/50 bg-rose-500/15'
-                    : 'border-white/[0.06] bg-white/[0.03] hover:bg-white/[0.05]'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="font-mono-custom text-[10px] tracking-[0.15em] text-rose-400/80">
-                    ค่าไม่ตรงกัน (DIFF)
-                  </p>
-                  <AlertTriangle size={14} className="text-rose-400" />
-                </div>
-                <p className="mt-1 font-display text-2xl font-extrabold text-rose-400">
-                  {result.modifiedCount.toLocaleString()}
-                </p>
-                <p className="mt-0.5 font-mono-custom text-[10px] text-white/35">วางเทียบข้างกันพร้อมไฮไลต์</p>
-              </button>
-
-              <button
-                onClick={() => setStatusFilter('only_a')}
-                className={`rounded-xl border p-4 text-left transition-all ${
-                  statusFilter === 'only_a'
-                    ? 'border-amber-500/50 bg-amber-500/15'
-                    : 'border-white/[0.06] bg-white/[0.03] hover:bg-white/[0.05]'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="font-mono-custom text-[10px] tracking-[0.15em] text-amber-400/80">
-                    มีเฉพาะฝั่ง A
-                  </p>
-                  <MinusCircle size={14} className="text-amber-400" />
-                </div>
-                <p className="mt-1 font-display text-2xl font-extrabold text-amber-400">
-                  {result.onlyACount.toLocaleString()}
-                </p>
-                <p className="mt-0.5 font-mono-custom text-[10px] text-white/35">ตกหล่นในไฟล์ B</p>
-              </button>
-
-              <button
-                onClick={() => setStatusFilter('only_b')}
-                className={`rounded-xl border p-4 text-left transition-all ${
-                  statusFilter === 'only_b'
-                    ? 'border-sky-500/50 bg-sky-500/15'
-                    : 'border-white/[0.06] bg-white/[0.03] hover:bg-white/[0.05]'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="font-mono-custom text-[10px] tracking-[0.15em] text-sky-400/80">
-                    มีเฉพาะฝั่ง B
-                  </p>
-                  <PlusCircle size={14} className="text-sky-400" />
-                </div>
-                <p className="mt-1 font-display text-2xl font-extrabold text-sky-400">
-                  {result.onlyBCount.toLocaleString()}
-                </p>
-                <p className="mt-0.5 font-mono-custom text-[10px] text-white/35">เกินมาในไฟล์ B</p>
-              </button>
-            </div>
-
-            {/* Filter Pills + Search + Export Bar */}
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
-              {/* Filter Tabs */}
-              <div className="flex flex-wrap items-center gap-1.5">
-                {[
-                  {
-                    id: 'diff_only' as const,
-                    label: `เฉพาะจุดต่าง (${(
-                      result.modifiedCount +
-                      result.onlyACount +
-                      result.onlyBCount
-                    ).toLocaleString()})`
-                  },
-                  { id: 'all' as const, label: `ดูทั้งหมดที่เรียงคู่กัน (${result.totalAligned.toLocaleString()})` },
-                  { id: 'modified' as const, label: `ค่าไม่ตรง (${result.modifiedCount.toLocaleString()})` },
-                  { id: 'only_a' as const, label: `มีเฉพาะ A (${result.onlyACount.toLocaleString()})` },
-                  { id: 'only_b' as const, label: `มีเฉพาะ B (${result.onlyBCount.toLocaleString()})` },
-                  { id: 'match' as const, label: `ตรงกัน (${result.matchCount.toLocaleString()})` }
-                ].map(tab => (
+                {summary.malformedCount > 0 && (
                   <button
-                    key={tab.id}
-                    onClick={() => setStatusFilter(tab.id)}
-                    className={`rounded-lg px-3 py-1.5 font-mono-custom text-[11px] transition-all ${
-                      statusFilter === tab.id
-                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold'
-                        : 'bg-white/5 text-white/50 hover:text-white/80 border border-transparent'
-                    }`}
+                    onClick={() => setStatusFilter('MALFORMED')}
+                    className="rounded bg-amber-500/20 px-2.5 py-1 font-bold text-amber-200 hover:bg-amber-500/30"
                   >
-                    {tab.label}
+                    ดูบรรทัดที่รูปแบบผิด ({summary.malformedCount})
                   </button>
-                ))}
+                )}
               </div>
+            )}
 
-              {/* Search & Actions */}
-              <div className="flex flex-1 items-center justify-end gap-2.5 min-w-[280px]">
-                <div className="relative flex-1 max-w-xs">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30" size={13} />
+            {/* 2. Search, Release Type Filter & Export Bar */}
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-slate-900/90 p-3">
+              <div className="flex flex-wrap flex-1 items-center gap-3 min-w-[260px]">
+                {/* Search Box */}
+                <div className="relative flex-1 max-w-sm">
+                  <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                   <input
                     type="text"
-                    placeholder="ค้นหาคำ, เบอร์, รหัสโปร..."
-                    value={searchTerm}
-                    onChange={e => setSearchTerm(e.target.value)}
-                    className="w-full rounded-xl border border-white/10 bg-black/30 py-2 pl-8 pr-3 font-mono-custom text-xs text-white/80 outline-none placeholder:text-white/25 focus:border-emerald-500/40"
+                    placeholder="ค้นหา Counter, Scenario Name, Release Object..."
+                    value={searchQuery}
+                    onChange={e => setSearchQuery(e.target.value)}
+                    className="w-full rounded-lg border border-white/15 bg-black/40 py-1.5 pl-8 pr-3 font-mono text-xs text-white placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none"
                   />
                 </div>
 
-                <button
-                  onClick={copyAlignedToClipboard}
-                  className="flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/5 px-3.5 py-2 font-mono-custom text-[11px] text-white/70 transition-all hover:border-white/30 hover:text-white"
-                >
-                  {copiedState === 'table' ? (
-                    <>
-                      <Check size={13} className="text-emerald-400" /> คัดลอกแล้ว
-                    </>
-                  ) : (
-                    <>
-                      <Copy size={13} /> ก๊อปปี้ตาราง
-                    </>
-                  )}
-                </button>
+                {/* Release Type Filter Pills (B, R, P, O) */}
+                <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-black/30 p-1 text-xs">
+                  <span className="flex items-center gap-1 px-2 text-slate-400">
+                    <Filter size={12} /> Type:
+                  </span>
+                  {(['ALL', 'P', 'O', 'B', 'R'] as const).map(rt => (
+                    <button
+                      key={rt}
+                      onClick={() => setReleaseTypeFilter(rt)}
+                      title={rt === 'ALL' ? 'ทุกประเภท' : RELEASE_TYPE_LABELS[rt]}
+                      className={`rounded px-2.5 py-1 font-mono font-bold transition ${
+                        releaseTypeFilter === rt
+                          ? 'bg-emerald-500 text-slate-950'
+                          : 'text-slate-300 hover:bg-white/10'
+                      }`}
+                    >
+                      {rt === 'ALL' ? 'ALL' : `${rt} (${RELEASE_TYPE_LABELS[rt].split(' ')[0]})`}
+                    </button>
+                  ))}
+                </div>
+              </div>
 
+              {/* Copy & Export Buttons */}
+              <div className="flex flex-wrap items-center gap-2">
                 <button
-                  onClick={exportReport}
-                  className="flex items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/15 px-4 py-2 font-mono-custom text-[11px] font-bold tracking-wider text-emerald-300 transition-all hover:bg-emerald-500/25"
+                  onClick={() => handleCopyFilteredPipe('TB')}
+                  className="flex items-center gap-1 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-200 transition hover:bg-amber-500/20"
                 >
-                  <Download size={13} /> EXPORT EXCEL
+                  {copiedId === 'TB' ? <Check size={13} /> : <Copy size={13} />}
+                  Copy ฝั่ง TB (Pipe)
+                </button>
+                <button
+                  onClick={() => handleCopyFilteredPipe('PROD')}
+                  className="flex items-center gap-1 rounded-lg border border-sky-500/30 bg-sky-500/10 px-2.5 py-1.5 text-xs font-medium text-sky-200 transition hover:bg-sky-500/20"
+                >
+                  {copiedId === 'PROD' ? <Check size={13} /> : <Copy size={13} />}
+                  Copy ฝั่ง PRD (Pipe)
+                </button>
+                <button
+                  onClick={handleExportExcel}
+                  className="flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-1.5 text-xs font-bold text-slate-950 transition hover:bg-emerald-400"
+                >
+                  <Download size={14} /> Export Excel
                 </button>
               </div>
             </div>
 
-            {/* Aligned Comparison Table */}
-            <div className="overflow-hidden rounded-2xl border border-white/10 bg-[#0d1017]">
-              {/* Table Header Bar */}
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.06] bg-[#0a0c10] px-6 py-3.5">
-                <div className="flex items-center gap-2.5">
-                  <Eye size={15} className="text-emerald-400" />
-                  <h2 className="font-display text-sm font-bold text-white">
-                    ตารางเปรียบเทียบข้อมูลที่จัดเรียงบรรทัดตรงกันแล้ว
-                  </h2>
-                  <span className="rounded-md bg-white/5 px-2 py-0.5 font-mono-custom text-[10px] text-white/40">
-                    แสดง {displayedRows.length.toLocaleString()} จาก {filteredRows.length.toLocaleString()} รายการ
-                  </span>
+            {/* 3. Structured 4-Column Comparison Table */}
+            <div className="overflow-hidden rounded-xl border border-white/10 bg-slate-900/95 shadow-2xl">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-slate-950 px-4 py-2.5 text-xs text-slate-400">
+                <div>
+                  แสดง <strong className="text-white">{displayedRows.length.toLocaleString()}</strong> จาก{' '}
+                  <strong className="text-white">{filteredRows.length.toLocaleString()}</strong> รายการ
                 </div>
-
-                <div className="flex items-center gap-3 font-mono-custom text-[10px] text-white/40">
-                  <span className="inline-flex items-center gap-1">
-                    <span className="h-2 w-2 rounded-sm bg-amber-400/70" /> ไฮไลต์สีส้ม = จุดต่างฝั่ง A
+                <div className="flex items-center gap-4">
+                  <span className="flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-sm bg-amber-500/50 border border-amber-400" />
+                    สีส้ม = ค่าฝั่ง Testbase (TB)
                   </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="h-2 w-2 rounded-sm bg-sky-400/70" /> ไฮไลต์สีฟ้า = จุดต่างฝั่ง B
+                  <span className="flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-sm bg-sky-500/50 border border-sky-400" />
+                    สีฟ้า = ค่าฝั่ง Production (PRD)
                   </span>
                 </div>
               </div>
 
-              <div className="max-h-[640px] overflow-y-auto">
-                <table className="w-full border-collapse text-left">
-                  <thead className="sticky top-0 z-10 bg-[#0a0c10]/95 backdrop-blur-md">
-                    <tr className="border-b border-white/[0.08]">
-                      <th className="w-16 px-4 py-3 font-mono-custom text-[10px] tracking-[0.15em] text-white/35">
-                        ลำดับ
-                      </th>
-                      <th className="w-28 px-3 py-3 font-mono-custom text-[10px] tracking-[0.15em] text-white/35">
-                        สถานะ
-                      </th>
-                      <th className="w-20 px-3 py-3 font-mono-custom text-[10px] tracking-[0.1em] text-amber-400/70 text-center">
-                        บรรทัด A
-                      </th>
-                      <th className="w-[40%] px-4 py-3 font-mono-custom text-[10px] tracking-[0.15em] text-amber-400">
-                        SOURCE A ({fileA.name || 'ฝั่ง A'})
-                      </th>
-                      <th className="w-20 px-3 py-3 font-mono-custom text-[10px] tracking-[0.1em] text-sky-400/70 text-center">
-                        บรรทัด B
-                      </th>
-                      <th className="w-[40%] px-4 py-3 font-mono-custom text-[10px] tracking-[0.15em] text-sky-400">
-                        SOURCE B ({fileB.name || 'ฝั่ง B'})
-                      </th>
+              <div className="max-h-[680px] overflow-auto">
+                <table className="w-full border-collapse text-left text-xs">
+                  <thead className="sticky top-0 z-10 bg-slate-950 text-[11px] uppercase tracking-wider text-slate-400 shadow">
+                    <tr className="border-b border-white/10">
+                      <th className="w-12 px-3 py-3 text-center">#</th>
+                      <th className="w-32 px-3 py-3">สถานะ / จุดที่ต่าง</th>
+                      <th className="w-20 px-2 py-3 text-center">บรรทัด (TB/PRD)</th>
+                      <th className="px-3 py-3">1. Counter</th>
+                      <th className="px-3 py-3">2. Scenario Name</th>
+                      <th className="w-28 px-3 py-3 text-center">3. Release Type</th>
+                      <th className="px-3 py-3">4. Release Object</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-white/[0.04]">
+                  <tbody className="divide-y divide-white/[0.06] font-mono">
                     {displayedRows.map(row => {
-                      const badge =
-                        row.status === 'match'
-                          ? { text: '✓ ตรงกัน', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' }
-                          : row.status === 'modified'
-                          ? { text: '≠ ไม่ตรงกัน', cls: 'bg-rose-500/15 text-rose-300 border-rose-500/30' }
-                          : row.status === 'only_a'
-                          ? { text: 'เฉพาะ A', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/30' }
-                          : { text: 'เฉพาะ B', cls: 'bg-sky-500/15 text-sky-300 border-sky-500/30' };
+                      const tb = row.tbRecord;
+                      const prod = row.prodRecord;
+                      const d = row.diffFields;
+
+                      const renderDualCell = (
+                        valTb: string | undefined,
+                        valProd: string | undefined,
+                        isFieldDiff: boolean
+                      ) => {
+                        if (row.status === 'MATCH') {
+                          return <span className="text-slate-300">{valTb}</span>;
+                        }
+                        if (row.status === 'ONLY_TB') {
+                          return <span className="text-amber-200 font-semibold">{valTb || '—'}</span>;
+                        }
+                        if (row.status === 'ONLY_PROD') {
+                          return <span className="text-sky-200 font-semibold">{valProd || '—'}</span>;
+                        }
+                        // MODIFIED or MALFORMED: If identical in this column, show once cleanly; if different, stack TB & PRD clearly
+                        if (!isFieldDiff) {
+                          return <span className="text-slate-300">{valTb || valProd}</span>;
+                        }
+                        return (
+                          <div className="flex flex-col gap-1 rounded-md border border-rose-500/30 bg-rose-500/[0.07] p-1.5">
+                            <div className="flex items-center gap-1.5">
+                              <span className="w-9 shrink-0 rounded bg-amber-500/20 px-1 py-0.5 text-center text-[9px] font-bold text-amber-300">
+                                TB
+                              </span>
+                              <FieldValueDiff valTb={valTb} valProd={valProd} isDiff={true} side="TB" />
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="w-9 shrink-0 rounded bg-sky-500/20 px-1 py-0.5 text-center text-[9px] font-bold text-sky-300">
+                                PRD
+                              </span>
+                              <FieldValueDiff valTb={valTb} valProd={valProd} isDiff={true} side="PROD" />
+                            </div>
+                          </div>
+                        );
+                      };
+
+                      const changedList: string[] = [];
+                      if (row.status === 'MODIFIED') {
+                        if (d.counter) changedList.push('Counter');
+                        if (d.scenarioName) changedList.push('Scenario');
+                        if (d.releaseType) changedList.push('Type');
+                        if (d.releaseObject) changedList.push('Object');
+                      }
 
                       return (
                         <tr
-                          key={row.index}
-                          className={`group transition-colors hover:bg-white/[0.03] ${
-                            row.status === 'match' ? 'opacity-75 hover:opacity-100' : ''
+                          key={row.id}
+                          className={`transition hover:bg-white/[0.04] ${
+                            row.status === 'MATCH'
+                              ? 'opacity-70 hover:opacity-100'
+                              : row.status === 'ONLY_TB'
+                              ? 'bg-amber-500/[0.03]'
+                              : row.status === 'ONLY_PROD'
+                              ? 'bg-sky-500/[0.03]'
+                              : 'bg-rose-500/[0.03]'
                           }`}
                         >
-                          <td className="px-4 py-3 font-mono-custom text-xs text-white/30">
-                            #{row.index}
+                          <td className="px-3 py-2.5 text-center text-slate-500">{row.id}</td>
+
+                          {/* Status Badge + Changed Column Pills */}
+                          <td className="px-3 py-2.5 font-sans">
+                            {row.status === 'MATCH' && (
+                              <span className="inline-block rounded bg-emerald-500/15 px-2 py-0.5 text-[11px] font-bold text-emerald-300 border border-emerald-500/30">
+                                ✓ ตรงกัน
+                              </span>
+                            )}
+                            {row.status === 'MODIFIED' && (
+                              <div>
+                                <span className="inline-block rounded bg-rose-500/20 px-2 py-0.5 text-[11px] font-bold text-rose-300 border border-rose-500/40">
+                                  ≠ ค่าไม่ตรงกัน
+                                </span>
+                                <div className="mt-1 flex flex-wrap gap-1">
+                                  {changedList.map(c => (
+                                    <span
+                                      key={c}
+                                      className="rounded bg-rose-500/30 px-1.5 py-0.5 text-[10px] font-semibold text-rose-100"
+                                    >
+                                      {c}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {row.status === 'ONLY_TB' && (
+                              <span className="inline-block rounded bg-amber-500/20 px-2 py-0.5 text-[11px] font-bold text-amber-300 border border-amber-500/40">
+                                มีเฉพาะ TB
+                              </span>
+                            )}
+                            {row.status === 'ONLY_PROD' && (
+                              <span className="inline-block rounded bg-sky-500/20 px-2 py-0.5 text-[11px] font-bold text-sky-300 border border-sky-500/40">
+                                มีเฉพาะ PRD
+                              </span>
+                            )}
+                            {row.status === 'MALFORMED' && (
+                              <div>
+                                <span className="inline-block rounded bg-amber-500/30 px-2 py-0.5 text-[11px] font-bold text-amber-200 border border-amber-400">
+                                  ⚠ รูปแบบผิด
+                                </span>
+                                <p className="mt-1 text-[10px] text-amber-300">
+                                  {tb?.malformedReason || prod?.malformedReason}
+                                </p>
+                              </div>
+                            )}
                           </td>
-                          <td className="px-3 py-3">
-                            <span
-                              className={`inline-block rounded-md border px-2 py-0.5 font-mono-custom text-[10px] font-bold ${badge.cls}`}
-                            >
-                              {badge.text}
-                            </span>
+
+                          {/* Original Line Numbers */}
+                          <td className="px-2 py-2.5 text-center text-[11px]">
+                            <span className="text-amber-300/80">{tb ? `L${tb.lineNumber}` : '-'}</span>
+                            <span className="mx-1 text-slate-600">/</span>
+                            <span className="text-sky-300/80">{prod ? `L${prod.lineNumber}` : '-'}</span>
                           </td>
-                          <td className="px-3 py-3 text-center font-mono-custom text-[11px] text-amber-300/50">
-                            {row.lineNumA ? `L${row.lineNumA}` : '—'}
+
+                          {/* 1. Counter */}
+                          <td className="px-3 py-2.5 align-middle">
+                            {renderDualCell(tb?.counter, prod?.counter, d.counter)}
                           </td>
-                          <td className="px-4 py-2.5 align-top">
-                            <div
-                              className={`rounded-lg border px-3 py-2 font-mono-custom text-xs leading-relaxed break-all ${
-                                row.status === 'match'
-                                  ? 'border-white/5 bg-white/[0.02] text-white/60'
-                                  : row.status === 'only_b'
-                                  ? 'border-dashed border-white/5 bg-transparent text-white/20'
-                                  : 'border-amber-500/20 bg-amber-500/[0.06] text-amber-100'
-                              }`}
-                            >
-                              {row.status === 'modified'
-                                ? renderInlineDiff(row.contentA, row.contentB, 'A')
-                                : row.contentA || <span className="text-white/20 italic">— ไม่มีในฝั่ง A —</span>}
-                            </div>
+
+                          {/* 2. Scenario Name */}
+                          <td className="px-3 py-2.5 align-middle">
+                            {renderDualCell(tb?.scenarioName, prod?.scenarioName, d.scenarioName)}
                           </td>
-                          <td className="px-3 py-3 text-center font-mono-custom text-[11px] text-sky-300/50">
-                            {row.lineNumB ? `L${row.lineNumB}` : '—'}
+
+                          {/* 3. Release Type */}
+                          <td className="px-3 py-2.5 text-center align-middle">
+                            {renderDualCell(tb?.releaseType, prod?.releaseType, d.releaseType)}
                           </td>
-                          <td className="px-4 py-2.5 align-top">
-                            <div
-                              className={`rounded-lg border px-3 py-2 font-mono-custom text-xs leading-relaxed break-all ${
-                                row.status === 'match'
-                                  ? 'border-white/5 bg-white/[0.02] text-white/60'
-                                  : row.status === 'only_a'
-                                  ? 'border-dashed border-white/5 bg-transparent text-white/20'
-                                  : 'border-sky-500/20 bg-sky-500/[0.06] text-sky-100'
-                              }`}
-                            >
-                              {row.status === 'modified'
-                                ? renderInlineDiff(row.contentA, row.contentB, 'B')
-                                : row.contentB || <span className="text-white/20 italic">— ไม่มีในฝั่ง B —</span>}
-                            </div>
+
+                          {/* 4. Release Object */}
+                          <td className="px-3 py-2.5 align-middle">
+                            {renderDualCell(tb?.releaseObject, prod?.releaseObject, d.releaseObject)}
                           </td>
                         </tr>
                       );
@@ -1541,42 +1084,50 @@ export default function ComparatorPage() {
 
                     {displayedRows.length === 0 && (
                       <tr>
-                        <td colSpan={6} className="py-20 text-center font-mono-custom text-xs text-white/30">
-                          ไม่พบรายการในหมวดหมู่นี้ (ลองเปลี่ยนตัวกรองด้านบนเป็น &ldquo;ดูทั้งหมดที่เรียงคู่กัน&rdquo;)
+                        <td colSpan={7} className="py-16 text-center font-sans text-sm text-slate-400">
+                          ไม่พบรายการที่ตรงกับเงื่อนไขการค้นหา
                         </td>
                       </tr>
                     )}
                   </tbody>
                 </table>
               </div>
+
+              {/* Load More Pagination for thousands of lines */}
+              {filteredRows.length > visibleLimit && (
+                <div className="border-t border-white/10 bg-slate-950 p-3 text-center">
+                  <button
+                    onClick={() => setVisibleLimit(prev => prev + PAGE_SIZE)}
+                    className="rounded-lg border border-emerald-500/40 bg-emerald-500/15 px-6 py-2 text-xs font-bold text-emerald-300 transition hover:bg-emerald-500/25"
+                  >
+                    แสดงเพิ่มอีก {PAGE_SIZE} รายการ (เหลืออีก{' '}
+                    {(filteredRows.length - visibleLimit).toLocaleString()} รายการ)
+                  </button>
+                </div>
+              )}
             </div>
           </div>
-        )}
-
-        {/* ── EMPTY STATE ── */}
-        {!result && !isProcessing && (
-          <div
-            className="fade-up mt-4 flex flex-col items-center justify-center rounded-2xl border border-dashed border-white/[0.07] py-24 text-center"
-            style={{ animationDelay: '140ms' }}
-          >
-            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-emerald-500/20 bg-emerald-500/5 text-emerald-400/60">
-              <GitCompare size={24} strokeWidth={1.5} />
+        ) : (
+          /* Empty State */
+          <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-white/15 bg-slate-900/40 py-20 text-center">
+            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-500/15 text-emerald-400">
+              <GitCompare size={24} />
             </div>
-            <p className="font-display text-lg font-bold text-white/50">
-              พร้อมจัดเรียงและเปรียบเทียบไฟล์
+            <h2 className="text-base font-bold text-white">
+              วางข้อมูล Scenario Release (คั่นด้วย |) หรืออัปโหลดไฟล์ทั้งฝั่ง TB และ PRD
+            </h2>
+            <p className="mt-1 max-w-lg text-xs text-slate-400">
+              ระบบจะตัด Header อัตโนมัติ จับคู่ตาม Scenario Name & Release Object แม้ลำดับบรรทัดสลับกัน และชี้จุดต่างรายคอลัมน์ทันที
             </p>
-            <p className="mt-1 max-w-md font-mono-custom text-xs text-white/25">
-              อัปโหลดไฟล์ Excel / CSV / TXT หรือวางข้อความทั้ง 2 ฝั่ง ระบบจะดึงบรรทัดที่เหมือนกันมาวางเทียบคู่กันให้อัตโนมัติแม้ลำดับบรรทัดจะสลับกัน
-            </p>
+            <button
+              onClick={handleLoadSample}
+              className="mt-5 flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-2.5 text-xs font-bold text-slate-950 shadow-lg transition hover:bg-emerald-400"
+            >
+              <Sparkles size={15} />
+              คลิกเพื่อโหลดข้อมูลตัวอย่าง Scenario Release
+            </button>
           </div>
         )}
-
-        {/* ── FOOTER ── */}
-        <footer className="mt-20 border-t border-white/[0.05] pt-8 text-center">
-          <p className="font-mono-custom text-[10px] tracking-[0.3em] text-white/15">
-            ARM@MOS · BILLONE INTERNAL ANALYTICS SYSTEMS
-          </p>
-        </footer>
       </div>
     </div>
   );
